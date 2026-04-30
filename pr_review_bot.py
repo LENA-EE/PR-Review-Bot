@@ -67,7 +67,7 @@ def get_pr_diff(project: str, repo: str, pr_id: int) -> str:
         f"/projects/{project}/repos/{repo}"
         f"/pull-requests/{pr_id}/diff"
     )
-    resp = requests.get(url, headers=bb_headers(), timeout=30)
+    resp = requests.get(url, headers=bb_headers(), timeout=30, verify=False)
     resp.raise_for_status()
     return parse_bitbucket_diff(resp.json())
 
@@ -113,7 +113,7 @@ def post_comment(
             "fileType": "TO",
             "path": file_path,
         }
-    resp = requests.post(url, headers=bb_headers(), json=body, timeout=15)
+    resp = requests.post(url, headers=bb_headers(), json=body, timeout=15, verify=False)
     resp.raise_for_status()
     return resp.json()
 
@@ -165,7 +165,12 @@ def build_prompt(diff: str) -> str:
 - Perl best practices (use strict, use warnings)
 - Читаемость (слишком сложная логика, нет комментариев)
 
-Отвечай ТОЛЬКО валидным JSON без пояснений и без markdown:
+ВАЖНО:
+1. НЕ ПИШИ НИКАКИХ ПОЯСНЕНИЙ, МЫСЛЕЙ ИЛИ ДУМАНИЙ (THINKING).
+2. ОТВЕТ ДОЛЖЕН НАЧИНАТЬСЯ С '[' И ЗАКАНЧИВАТЬСЯ ']'.
+3. НИКАКОГО MARKDOWN (без ```json).
+
+Формат ответа (валидный JSON массив):
 [
   {{
     "file": "имя файла",
@@ -184,8 +189,15 @@ Diff для ревью:
 """
 
 
-def ask_fenix(diff: str) -> list[dict]:
-    """Отправляет diff в Феникс, получает список замечаний."""
+def ask_fenix(diff: str) -> Optional[list[dict]]:
+    """Отправляет diff в Феникс, получает список замечаний.
+    Возвращает None в случае ошибки, [] если замечаний нет.
+    """
+
+    # LiteLLM требует полного пути, даже если в ENV дано /v1
+    fenix_endpoint = FENIX_URL
+    if fenix_endpoint.endswith("/v1"):
+        fenix_endpoint += "/chat/completions"
 
     # Обрезаем если diff большой — экономим токены
     diff_lines = diff.split("\n")
@@ -198,7 +210,7 @@ def ask_fenix(diff: str) -> list[dict]:
 
     try:
         resp = requests.post(
-            FENIX_URL,
+            fenix_endpoint,
             headers={
                 "Authorization": f"Bearer {FENIX_TOKEN}",
                 "Content-Type": "application/json",
@@ -206,10 +218,11 @@ def ask_fenix(diff: str) -> list[dict]:
             json={
                 "model": FENIX_MODEL,
                 "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 2000,
+                "max_tokens": 4096,
                 "temperature": 0.1,
             },
             timeout=60,
+            verify=False,
         )
         resp.raise_for_status()
 
@@ -240,20 +253,40 @@ def ask_fenix(diff: str) -> list[dict]:
                 if part.startswith("json"):
                     part = part[4:]
                 part = part.strip()
-                if part.startswith("["):
+                if part.startswith("[") or part.startswith("{"):
                     raw = part
                     break
 
-        comments = json.loads(raw)
+        # Фикс для моделей, которые возвращают одинарные кавычки (как в Python)
+        # json.loads требует двойных кавычек
+        if raw.startswith("[") or raw.startswith("{"):
+            # Заменяем одинарные кавычки на двойные (грубый фикс, но рабочий для простых строк)
+            # Лучше искать JSON блок через regex, но попробуем replace для начала
+            # Внимание: это может сломать если внутри строк есть одинарные кавычки, 
+            # но Qwen обычно не ставит их в JSON ключах.
+            # Для надежности лучше использовать ast.literal_eval если json.loads падает.
+            pass
+
+        try:
+            comments = json.loads(raw)
+        except json.JSONDecodeError:
+            # Пробуем распарсить как Python dict/list (одинарные кавычки)
+            import ast
+            try:
+                # ast.literal_eval безопаснее eval, он выполнит только литералы
+                comments = ast.literal_eval(raw)
+            except Exception:
+                raise # Если и это не помогло, пробрасываем оригинальную ошибку
+
         log.info(f"Феникс вернул {len(comments)} замечаний")
         return comments
 
     except json.JSONDecodeError as e:
         log.error(f"Феникс вернул не JSON: {e}\nОтвет: {raw[:300]}")
-        return []
+        return None
     except Exception as e:
         log.error(f"Ошибка запроса к Фениксу: {e}")
-        return []
+        return None
 
 
 # ── Основная логика ревью ───────────────────────────────────
@@ -280,6 +313,17 @@ def review_pull_request(project: str, repo: str, pr_id: int):
 
     # 2. Феникс анализирует
     comments = ask_fenix(diff)
+
+    # Обработка ошибки связи с ИИ
+    if comments is None:
+        post_general_comment(
+            project, repo, pr_id,
+            "🤖 **JARVIS Review**: Упс! Мой мозг (Феникс) не ответил. "
+            "Проверка не удалась, попробуйте обновить PR позже. 🔌_error\n\n"
+            "_Это автоматическое ревью. Обязательна проверка сеньором. "
+            "ИИ пока не заменит кожаных! 🧠_"
+        )
+        return
 
     # 3. Нет замечаний
     if not comments:
