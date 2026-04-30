@@ -1,0 +1,17 @@
+services:
+  pr-review-bot:
+    build: .
+    container_name: pr-review-bot
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+    environment:
+      - BITBUCKET_URL=${BITBUCKET_URL}
+      - BITBUCKET_TOKEN=${BITBUCKET_TOKEN}
+      - FENIX_URL=${FENIX_URL}
+      - FENIX_TOKEN=${FENIX_TOKEN}
+      - FENIX_MODEL=${FENIX_MODEL:-qwen}
+      - MAX_DIFF_LINES=${MAX_DIFF_LINES:-300}
+    volumes:
+      # Стайлгайд монтируется снаружи — обновляй без перезапуска контейнера
+      - ./styleguide.md:/app/styleguide.md:ro

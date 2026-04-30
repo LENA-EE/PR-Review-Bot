@@ -1,0 +1,11 @@
+# Эти файлы НИКОГДА не попадут в образ
+.env
+*.env
+.env.*
+!.env.example
+
+*.tar
+*.log
+__pycache__
+*.pyc
+.git
