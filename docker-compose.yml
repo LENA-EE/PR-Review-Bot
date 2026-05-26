@@ -12,6 +12,12 @@ services:
       - FENIX_TOKEN=${FENIX_TOKEN}
       - FENIX_MODEL=${FENIX_MODEL:-qwen}
       - MAX_DIFF_LINES=${MAX_DIFF_LINES:-300}
+      # Параметры обращения к Фениксу (опциональны — дефолты заданы тут же через :-).
+      # Если в .env нет — подставится значение справа от :-, образ пересобирать не нужно.
+      - FENIX_MAX_TOKENS=${FENIX_MAX_TOKENS:-4096}
+      - FENIX_TIMEOUT=${FENIX_TIMEOUT:-90}
+      - FENIX_MAX_CONCURRENCY=${FENIX_MAX_CONCURRENCY:-1}
+      - FENIX_MAX_RETRIES=${FENIX_MAX_RETRIES:-1}
     volumes:
       # Стайлгайд монтируется снаружи — обновляй без перезапуска контейнера
       - ./styleguide.md:/app/styleguide.md:ro
