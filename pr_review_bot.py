@@ -145,7 +145,13 @@ def _comment_key(path: Optional[str], line: Optional[int], text: str) -> tuple:
     форматирования не считались новым комментарием.
     """
     norm = " ".join((text or "").split()).lower()
-    return (path or "", int(line) if line else 0, norm)
+    # line из ответа LLM может быть кривым ("unknown", "42-45", None) —
+    # не валим ревью, недопреобразуемое считаем за 0.
+    try:
+        line_num = int(line) if line else 0
+    except (TypeError, ValueError):
+        line_num = 0
+    return (path or "", line_num, norm)
 
 
 def get_existing_comment_keys(project: str, repo: str, pr_id: int) -> set:
@@ -368,13 +374,16 @@ def ask_fenix(diff: str) -> Optional[list[dict]]:
     if not FENIX_SEMAPHORE.acquire(blocking=False):
         log.info("⏳ Жду свободный слот Феникса (идёт другое ревью)...")
         FENIX_SEMAPHORE.acquire()
+    raw = ""  # на случай, если resp.json() вернёт не-JSON и сработает except ниже
     try:
         resp = _fenix_request_with_retry(fenix_endpoint, payload)
         if resp is None:
             return None  # таймаут/429/HTTP-ошибка — причина уже залогирована
 
         data = resp.json()
-        finish = data.get("choices", [{}])[0].get("finish_reason", "")
+        # choices может прийти пустым ([]) — берём {} вместо падения IndexError
+        first_choice = (data.get("choices") or [{}])[0]
+        finish = first_choice.get("finish_reason", "")
         usage = data.get("usage", {}) or {}
         log.info(
             f"📥 Ответ Феникса: finish_reason={finish}, "
@@ -394,11 +403,7 @@ def ask_fenix(diff: str) -> Optional[list[dict]]:
 
         # Пробуем разные форматы ответа
         # Формат OpenAI-совместимый
-        raw = (
-            data.get("choices", [{}])[0]
-                .get("message", {})
-                .get("content", "")
-        )
+        raw = first_choice.get("message", {}).get("content", "")
         # Если не OpenAI — пробуем прямой формат
         if not raw:
             raw = data.get("response", "")
