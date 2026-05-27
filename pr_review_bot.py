@@ -32,10 +32,12 @@ BITBUCKET_TOKEN = os.getenv("BITBUCKET_TOKEN", "")
 
 FENIX_URL   = os.getenv("FENIX_URL",   "http://fenix.bank.ru/api/chat")
 FENIX_TOKEN = os.getenv("FENIX_TOKEN", "")
-FENIX_MODEL = os.getenv("FENIX_MODEL", "qwen")
+FENIX_MODEL = os.getenv("FENIX_MODEL", "DeepSeek V3.2")
 
-# Максимум строк диффа за один запрос — экономим токены Феникса
-MAX_DIFF_LINES = int(os.getenv("MAX_DIFF_LINES", "300"))
+# Максимум строк диффа НА ОДИН ФАЙЛ за запрос. REV-001: ревью идёт пофайлово,
+# поэтому лимит теперь на файл, а не на склеенный diff всего PR (раньше хвост
+# multi-file PR молча выпадал). Защита бюджета Феникса.
+MAX_DIFF_LINES = int(os.getenv("MAX_DIFF_LINES", "400"))
 
 # Лимит длины ответа модели. 4096 с запасом для ревью (10 коротких замечаний),
 # а 16384 раньше провоцировал таймаут и зря бронировал бюджет Феникса (~700k ток/мин).
@@ -76,8 +78,8 @@ def bb_headers() -> dict:
     }
 
 
-def get_pr_diff(project: str, repo: str, pr_id: int) -> str:
-    """Забирает diff Pull Request из Bitbucket."""
+def get_pr_diff(project: str, repo: str, pr_id: int) -> list[dict]:
+    """Забирает diff Pull Request из Bitbucket, разбитый по файлам."""
     url = (
         f"{BITBUCKET_URL}/rest/api/1.0"
         f"/projects/{project}/repos/{repo}"
@@ -88,23 +90,41 @@ def get_pr_diff(project: str, repo: str, pr_id: int) -> str:
     return parse_bitbucket_diff(resp.json())
 
 
-def parse_bitbucket_diff(diff_json: dict) -> str:
-    """Конвертирует Bitbucket diff JSON в читаемый текст."""
-    lines = []
+def parse_bitbucket_diff(diff_json: dict) -> list[dict]:
+    """Разбирает Bitbucket diff JSON в СПИСОК файлов.
+
+    Каждый файл — отдельный dict {path, text, added_lines}, чтобы ревьюить файлы
+    по одному (REV-001: не терять хвост multi-file PR в общей обрезке диффа).
+
+    В text каждая строка помечена реальным номером новой версии — [L<n>]
+    (REV-002: модель ставит точный номер в ответ, а не угадывает). Номер берём
+    из поля `destination` строки сегмента (TO-сторона, есть у ADDED и CONTEXT;
+    у REMOVED его нет — такие строки даём без номера, модель их и так игнорирует).
+    """
+    files: list[dict] = []
     for diff in diff_json.get("diffs", []):
         path = diff.get("destination", {}).get("toString", "unknown")
-        lines.append(f"\n--- Файл: {path} ---")
+        text_lines: list[str] = []
+        added = 0
         for hunk in diff.get("hunks", []):
             for segment in hunk.get("segments", []):
                 seg_type = segment.get("type", "")
-                prefix = (
-                    "+" if seg_type == "ADDED"
-                    else "-" if seg_type == "REMOVED"
-                    else " "
-                )
                 for line in segment.get("lines", []):
-                    lines.append(f"{prefix}{line.get('line', '')}")
-    return "\n".join(lines)
+                    content = line.get("line", "")
+                    dest = line.get("destination")
+                    if seg_type == "ADDED":
+                        added += 1
+                        text_lines.append(f"[L{dest}] +{content}")
+                    elif seg_type == "REMOVED":
+                        text_lines.append(f"       -{content}")
+                    else:  # CONTEXT — для понимания, номер показываем
+                        text_lines.append(f"[L{dest}]  {content}")
+        files.append({
+            "path": path,
+            "text": "\n".join(text_lines),
+            "added_lines": added,
+        })
+    return files
 
 
 def post_comment(
@@ -222,9 +242,7 @@ def load_styleguide() -> str:
         return ""
 
 
-def build_prompt(diff: str) -> str:
-    styleguide = load_styleguide()
-
+def build_prompt(diff: str, styleguide: str) -> str:
     styleguide_section = ""
     if styleguide:
         styleguide_section = f"""
@@ -236,8 +254,10 @@ def build_prompt(diff: str) -> str:
 
     return f"""
 Ты опытный Perl разработчик и делаешь code review.
-Смотри ТОЛЬКО на добавленные строки (начинаются с +).
-Не комментируй удалённые строки и контекст.
+Тебе дан diff ОДНОГО файла. Каждая строка помечена реальным номером новой версии: [L<номер>].
+Смотри ТОЛЬКО на добавленные строки (помечены `[L<номер>] +`).
+Строки контекста (с `[L<номер>]`, но без `+`) — только для понимания, их НЕ комментируй.
+Удалённые строки (с `-`) игнорируй.
 {styleguide_section}
 Проверяй:
 - Валидация входных параметров (нет проверки undef, пустых строк)
@@ -255,12 +275,13 @@ def build_prompt(diff: str) -> str:
 [
   {{
     "file": "имя файла",
-    "line": номер_строки,
+    "line": номер_из_метки_L,
     "severity": "error|warning|suggestion",
     "comment": "конкретное замечание понятным языком"
   }}
 ]
 
+В поле "line" укажи ЧИСЛО из метки [L<номер>] той строки, к которой относится замечание. НЕ придумывай номер сам.
 Если замечаний нет — верни пустой массив: []
 Максимум 10 замечаний — только самые важные (приоритет P0/P1: баги, безопасность, потеря данных).
 Каждое замечание — максимум 1-2 предложения, по сути, без воды и без повторов.
@@ -336,9 +357,10 @@ def _fenix_request_with_retry(endpoint: str, payload: dict):
     return None
 
 
-def ask_fenix(diff: str) -> Optional[list[dict]]:
+def ask_fenix(diff: str, styleguide: str) -> Optional[list[dict]]:
     """Отправляет diff в Феникс, получает список замечаний.
     Возвращает None в случае ошибки, [] если замечаний нет.
+    styleguide передаётся снаружи (читается раз на PR, не на каждый файл).
     """
 
     # LiteLLM требует полного пути, даже если в ENV дано /v1
@@ -353,7 +375,7 @@ def ask_fenix(diff: str) -> Optional[list[dict]]:
         diff += f"\n\n[... обрезано, первые {MAX_DIFF_LINES} строк ...]"
         log.warning(f"Diff обрезан до {MAX_DIFF_LINES} строк")
 
-    prompt = build_prompt(diff)
+    prompt = build_prompt(diff, styleguide)
     # Диагностика: размер запроса (грубая оценка токенов — 1 токен ≈ 4 символа для латиницы,
     # для Perl-кода и русского промпта реальное соотношение хуже, цифра — нижняя граница)
     log.info(
@@ -485,9 +507,9 @@ def review_pull_request(project: str, repo: str, pr_id: int):
 
 def _do_review(project: str, repo: str, pr_id: int):
     """Внутренняя логика ревью."""
-    # 1. Забираем diff
+    # 1. Забираем diff, разбитый по файлам
     try:
-        diff = get_pr_diff(project, repo, pr_id)
+        files = get_pr_diff(project, repo, pr_id)
     except Exception as e:
         log.error(f"Не удалось получить diff: {e}")
         post_general_comment(
@@ -497,15 +519,59 @@ def _do_review(project: str, repo: str, pr_id: int):
         )
         return
 
-    if not diff.strip():
+    if not files:
         log.info("Diff пустой, пропускаю")
         return
 
-    # 2. Феникс анализирует
-    comments = ask_fenix(diff)
+    log.info(
+        f"📂 Файлов в PR #{pr_id}: {len(files)} — "
+        f"{[f['path'] for f in files]}"
+    )
 
-    # Обработка ошибки связи с ИИ
-    if comments is None:
+    # Стайлгайд читаем ОДИН раз на PR (а не на каждый файл) — экономим диск и токены
+    # Феникса (раньше при N файлах стайлгайд слался N раз). Чтение именно здесь, а не
+    # на старте контейнера, сохраняет hot-reload: правки styleguide.md подхватываются
+    # на следующем PR без рестарта (FR-008).
+    styleguide = load_styleguide()
+
+    # 2. Ревьюим КАЖДЫЙ файл отдельным запросом (REV-001 — хвост PR не теряется).
+    all_comments: list[dict] = []
+    reviewed = 0
+    fenix_failed: list[str] = []   # файлы, по которым Феникс не ответил
+    for f in files:
+        path = f["path"]
+        if f["added_lines"] == 0:
+            log.info(f"⏭️ {path}: нет добавленных строк — пропускаю")
+            continue
+        n_lines = f["text"].count("\n") + 1
+        if n_lines > MAX_DIFF_LINES:
+            log.warning(
+                f"✂️ {path}: {n_lines} строк > лимит {MAX_DIFF_LINES} — "
+                f"будет обрезан хвост файла"
+            )
+        result = ask_fenix(f["text"], styleguide)
+        if result is None:
+            log.warning(f"⚠️ {path}: Феникс не ответил — файл не проверен")
+            fenix_failed.append(path)
+            continue
+        reviewed += 1
+        for c in result:
+            # Имя файла НЕ передаётся модели в промпте (один файл на запрос), поэтому
+            # её поле "file" — мусор (плейсхолдер/галлюцинация). Путь нам достоверно
+            # известен — проставляем его безусловно, иначе инлайн-анкор не сойдётся
+            # с Bitbucket и замечание свалится в общий комментарий (срыв REV-002).
+            if isinstance(c, dict):
+                c["file"] = path
+                all_comments.append(c)
+
+    # Нечего ревьюить: ни в одном файле нет добавленных строк (только удаления/контекст).
+    # По конституции (Сценарий 4 «Пустой diff») — пропускаем молча.
+    if reviewed == 0 and not fenix_failed:
+        log.info("Нет добавленных строк ни в одном файле — пропускаю молча")
+        return
+
+    # Ни один файл не проверен (все провалились по Фениксу) — ведём себя как раньше.
+    if reviewed == 0 and fenix_failed:
         post_general_comment(
             project, repo, pr_id,
             "🤖 **JARVIS Review**: Упс! Мой мозг (Феникс) не ответил. "
@@ -515,16 +581,29 @@ def _do_review(project: str, repo: str, pr_id: int):
         )
         return
 
+    # Решение Елены: если часть файлов не проверена из-за Феникса — честно сказать в PR,
+    # что проблема на стороне ИИ-сервиса, а не качества ревьюера.
+    failed_note = ""
+    if fenix_failed:
+        failed_note = (
+            f"\n\n⚠️ Не удалось проверить файлы (Феникс не ответил): "
+            f"{', '.join(fenix_failed)}.\n"
+            f"_Это сбой на стороне ИИ-сервиса, а не проблема PR. "
+            f"Обнови PR позже для повторной проверки этих файлов._"
+        )
+
     # Состояние «что уже прокомментировано» берём из самого PR (бот stateless).
     # Это и есть защита от дублей на pr:modified — уже висящее игнорируем.
     existing = get_existing_comment_keys(project, repo, pr_id)
 
     # 3. Нет замечаний
-    if not comments:
+    if not all_comments:
         no_issues = (
-            "🤖 **JARVIS Review**: Автоматическая проверка завершена.\n\n"
-            "✅ Критических замечаний не найдено.\n\n"
-            "_Обязательна проверка сеньором._"
+            "🤖 **JARVIS Review**: Проверка завершена — замечаний нет! 🎉\n\n"
+            "✅ Код чистый, придраться не к чему. Отличная работа! 👏\n\n"
+            "_Это автоматическое ревью, финальное слово за сеньором "
+            "(ИИ пока не заменит кожаных 🧠)._"
+            + failed_note
         )
         if _comment_key(None, None, no_issues) in existing:
             log.info("⏭️ Комментарий «замечаний нет» уже есть — пропускаю")
@@ -541,7 +620,7 @@ def _do_review(project: str, repo: str, pr_id: int):
 
     posted = 0
     skipped = 0
-    for item in comments:
+    for item in all_comments:
         emoji = severity_emoji.get(item.get("severity", "suggestion"), "💡")
         text = (
             f"{emoji} **JARVIS Review** "
@@ -577,22 +656,28 @@ def _do_review(project: str, repo: str, pr_id: int):
                 log.error(f"Не удалось запостить: {e2}")
 
     # 5. Итоговый комментарий
-    errors   = sum(1 for c in comments if c.get("severity") == "error")
-    warnings = sum(1 for c in comments if c.get("severity") == "warning")
-    tips     = sum(1 for c in comments if c.get("severity") == "suggestion")
+    errors   = sum(1 for c in all_comments if c.get("severity") == "error")
+    warnings = sum(1 for c in all_comments if c.get("severity") == "warning")
+    tips     = sum(1 for c in all_comments if c.get("severity") == "suggestion")
 
     summary = (
         f"🤖 **JARVIS Review** — автоматическая проверка завершена\n\n"
+        f"📂 Проверено файлов: {reviewed}/{len(files)}\n"
         f"🔴 Ошибок: {errors} · "
         f"🟡 Предупреждений: {warnings} · "
         f"💡 Подсказок: {tips}\n\n"
         f"_Это автоматическое ревью. Обязательна проверка сеньором._"
+        + failed_note
     )
     if _comment_key(None, None, summary) in existing:
         log.info("⏭️ Итоговый комментарий уже есть — пропускаю")
     else:
         post_general_comment(project, repo, pr_id, summary)
-    log.info(f"✅ Ревью завершено. Запостил {posted} комментариев, пропущено дублей {skipped}.")
+    log.info(
+        f"✅ Ревью завершено. Файлов проверено {reviewed}/{len(files)}, "
+        f"запостил {posted} комментариев, пропущено дублей {skipped}, "
+        f"не проверено (Феникс) {len(fenix_failed)}."
+    )
 
 
 # ── Webhook endpoint ────────────────────────────────────────
