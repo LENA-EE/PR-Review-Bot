@@ -1,4 +1,4 @@
-Твоя часть (дома):
+
 1. Скачай Docker Desktop если нет
 2. Положи все файлы в одну папку
 3. Заполни styleguide.md правилами из Confluence
@@ -9,13 +9,13 @@
    ВАЖНО: это только проверка живости. Реального ревью тут НЕ будет —
    токенов и настроек нет (см. раздел про ENV ниже). Для боевого запуска — compose.
 6. docker save pr-review-bot -o pr-review-bot.tar
-7. Передай Ярославу: .tar + docker-compose.yml + .env.example + styleguide.md
+7. Передай девопс: .tar + docker-compose.yml + .env.example + styleguide.md
 
-Часть Ярослава (виртуалка):
+Часть девопс(виртуалка):
 8. docker load -i pr-review-bot.tar
 9. Создать .env из .env.example и заполнить реальными токенами
 10. docker-compose up -d
-11. Настроить реверс-прокси (как у твоего MCP)
+11. Настроить реверс-прокси 
 12. Настроить webhook в Bitbucket
 
 ═══════════════════════════════════════════════════════════════
