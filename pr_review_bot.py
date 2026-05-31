@@ -758,7 +758,14 @@ async def bitbucket_webhook(request: Request, background_tasks: BackgroundTasks)
     event = payload.get("eventKey", "")
     log.info(f"📨 Получен webhook: {event}")
 
-    if event not in ("pr:opened", "pr:modified"):
+    # pr:opened          — PR создан
+    # pr:from_ref_updated — в PR ЗАПУШЕНЫ НОВЫЕ КОММИТЫ (обновился исходный ref) —
+    #                       именно это событие, а не pr:modified, шлёт Bitbucket на пуш;
+    #                       без него повторная проверка на новый пуш не запускалась.
+    # pr:modified         — изменены метаданные PR (заголовок/описание/target/ревьюеры),
+    #                       НЕ коммиты; держим для совместимости.
+    # Дубли на повторных прогонах гасит дедуп по существующим комментариям (REV-003).
+    if event not in ("pr:opened", "pr:from_ref_updated", "pr:modified"):
         return {"status": "ignored", "event": event}
 
     pr        = payload.get("pullRequest", {})
