@@ -112,13 +112,18 @@ def parse_bitbucket_diff(diff_json: dict) -> list[dict]:
                 for line in segment.get("lines", []):
                     content = line.get("line", "")
                     dest = line.get("destination")
+                    # Метку [L<n>] ставим, ТОЛЬКО если номер реально есть. Без неё (rename,
+                    # бинарь, краевой ханк без destination) фолбэк по plan.md §6: строку
+                    # отдаём без номера — модель угадает, но не получит фейковый [LNone],
+                    # который иначе утёк бы в поле "line" и сорвал инлайн-привязку.
+                    label = f"[L{dest}] " if dest is not None else ""
                     if seg_type == "ADDED":
                         added += 1
-                        text_lines.append(f"[L{dest}] +{content}")
+                        text_lines.append(f"{label}+{content}")
                     elif seg_type == "REMOVED":
                         text_lines.append(f"       -{content}")
-                    else:  # CONTEXT — для понимания, номер показываем
-                        text_lines.append(f"[L{dest}]  {content}")
+                    else:  # CONTEXT — для понимания, номер показываем если есть
+                        text_lines.append(f"{label} {content}")
         files.append({
             "path": path,
             "text": "\n".join(text_lines),
