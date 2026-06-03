@@ -6,6 +6,10 @@
 
 *.tar
 *.log
+*.bak
 __pycache__
 *.pyc
 .git
+
+# Тестовые фикстуры — в образ не идут (Dockerfile копирует только бота)
+live_runbook_v11/

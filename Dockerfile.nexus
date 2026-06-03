@@ -1,0 +1,37 @@
+# Dockerfile.nexus — сборка ВНУТРИ банка (bsk-hooks), пакеты из Nexus, без интернета.
+#
+# Дома собирай обычным `Dockerfile` (база python:3.11-slim из публичного реестра).
+# Здесь база-образ и pip-пакеты берутся из внутреннего Nexus.
+#
+# Перед первой сборкой подставь значения <...> (их даёт владелец Nexus, п. 2.2 плана):
+#   <nexus-docker-registry>:<port>  — внутренний Docker-реестр Nexus (для FROM)
+#   <nexus-host>                    — хост Nexus
+#   <pypi-repo>                     — имя PyPI-прокси-репозитория в Nexus
+#
+# Сборка:  docker build -f Dockerfile.nexus -t pr-review-bot .
+
+# База тянется демоном Docker из внутреннего реестра Nexus; версия зафиксирована.
+# (Чтобы это сработало, демон на bsk-hooks должен уметь ходить в этот реестр —
+#  возможно, потребуется insecure-registries в /etc/docker/daemon.json, если http.)
+FROM <nexus-docker-registry>:<port>/python:3.11.9-slim
+
+WORKDIR /app
+
+# pip ходит не в интернет, а в прокси-репозиторий PyPI внутри Nexus.
+# --trusted-host нужен ТОЛЬКО если Nexus по http или с самоподписанным сертом;
+# при нормальном https-серте эту строку можно убрать.
+COPY requirements.txt .
+RUN pip install --no-cache-dir \
+    --index-url https://<nexus-host>/repository/<pypi-repo>/simple \
+    --trusted-host <nexus-host> \
+    -r requirements.txt
+
+# Код бота
+COPY pr_review_bot.py .
+
+# Стайлгайд — необязательный файл, монтируется снаружи через volume
+# (см. docker-compose.yml). В образ НЕ кладём.
+
+EXPOSE 9000
+
+CMD ["python", "pr_review_bot.py"]
