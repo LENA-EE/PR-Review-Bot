@@ -22,6 +22,8 @@ _ADDED_RE = re.compile(r"^(?:\[L\d+\]\s)?\+(.*)$")
 _REMOVED_RE = re.compile(r"^\s+-(.*)$")
 # Объявление сабрутины.
 _SUB_RE = re.compile(r"\bsub\s+(\w+)")
+# Добавленная строка С номером и объявлением sub — для привязки инлайн-комментария.
+_ADDED_SUB_LINE_RE = re.compile(r"^\[L(\d+)\]\s\+.*\bsub\s+(\w+)")
 
 
 def changed_subs_from_diff_text(diff_text: Optional[str]) -> set[str]:
@@ -45,3 +47,19 @@ def changed_subs_from_diff_text(diff_text: Optional[str]) -> set[str]:
             names.add(sub.group(1))
 
     return names
+
+
+def added_sub_lines(diff_text: Optional[str]) -> dict:
+    """Карта {имя_функции: номер_строки} для ДОБАВЛЕННЫХ объявлений `sub` (TO-сторона).
+
+    Нужна, чтобы повесить импакт-комментарий инлайн — на строку, где функция объявлена/
+    переименована в этом PR. У удалённых строк номера нет (FROM-сторона) — их тут нет.
+    """
+    out: dict = {}
+    if not diff_text:
+        return out
+    for line in diff_text.splitlines():
+        m = _ADDED_SUB_LINE_RE.match(line)
+        if m:
+            out.setdefault(m.group(2), int(m.group(1)))
+    return out
