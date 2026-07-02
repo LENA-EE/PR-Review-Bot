@@ -31,6 +31,14 @@ IMPACT_ENABLED и т.д.). Токены в аргументах командно
   # project/repo можно не указывать, если заданы ENV BITBUCKET_PROJECT / BITBUCKET_REPO:
   BITBUCKET_PROJECT=MYPROJ BITBUCKET_REPO=my-repo python3 review_cli.py --pr-id 42
 
+  # Прогон эксперимента (spec 011): в PR ничего не пишется, результат — в файл.
+  # Режим A (как в проде):
+  python3 review_cli.py --pr-id 42 --dry-run --out-dir ~/jarvis_experiment/A_hunks \
+      --context-mode hunks
+  # Режим B (полный файл как контекст):
+  python3 review_cli.py --pr-id 42 --dry-run --out-dir ~/jarvis_experiment/B_file \
+      --context-mode file
+
 Коды возврата:
   0 — успех (в т.ч. «открытого PR по ветке нет — ревьюить нечего»);
   1 — реальная ошибка (нет токенов/сеть/невалидные аргументы/сбой Bitbucket API).
@@ -107,6 +115,35 @@ def parse_args(argv: "list[str] | None" = None) -> argparse.Namespace:
         ),
     )
 
+    # ── Эксперимент «полный файл как контекст» (spec 011) ──
+    # Флаги дублируют ENV сознательно: опечатка в имени переменной окружения
+    # тихо оставила бы dry-run выключенным, и прогон начал бы писать комментарии
+    # в живые PR. Явный флаг в командной строке такой ошибки не допускает.
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Не публиковать комментарии в PR: всё, что бот запостил бы, пишется "
+            "в JSONL-отчёт (нужен --out-dir). Для сравнения режимов на реальных PR."
+        ),
+    )
+    parser.add_argument(
+        "--out-dir",
+        help=(
+            "Папка для отчётов dry-run (АБСОЛЮТНЫЙ путь ВНЕ клона репозитория). "
+            "Файл на каждый PR: pr_<id>.jsonl. По умолчанию — ENV JARVIS_DRY_RUN_DIR."
+        ),
+    )
+    parser.add_argument(
+        "--context-mode",
+        choices=("hunks", "file"),
+        help=(
+            "Что показывать модели: hunks — только куски diff'а (как в проде), "
+            "file — полный текст файла с пометкой изменённых строк. "
+            "По умолчанию — ENV REVIEW_CONTEXT_MODE (иначе hunks)."
+        ),
+    )
+
     args = parser.parse_args(argv)
 
     # project/repo обязательны по смыслу, но могут прийти из ENV — проверяем вручную,
@@ -118,6 +155,23 @@ def parse_args(argv: "list[str] | None" = None) -> argparse.Namespace:
         missing.append("--repo (или ENV BITBUCKET_REPO)")
     if missing:
         parser.error("не заданы обязательные параметры: " + ", ".join(missing))
+
+    # Папка отчётов обязательна при dry-run и обязана быть абсолютной. Без этого
+    # отчёт лёг бы в текущую директорию — а она на сервере обычно клон банковского
+    # репозитория, откуда содержимое может уехать в git.
+    if args.dry_run:
+        out_dir = args.out_dir or os.getenv("JARVIS_DRY_RUN_DIR", "").strip()
+        # ~ раскрываем сами: в кавычках оболочка его не развернёт, и путь окажется
+        # относительным — то есть внутри клона репозитория.
+        out_dir = os.path.expanduser(out_dir) if out_dir else out_dir
+        if not out_dir:
+            parser.error(
+                "--dry-run требует --out-dir (или ENV JARVIS_DRY_RUN_DIR): "
+                "укажи абсолютный путь вне клона репозитория"
+            )
+        if not os.path.isabs(out_dir):
+            parser.error(f"--out-dir должен быть абсолютным путём, получено: {out_dir}")
+        args.out_dir = out_dir
 
     return args
 
@@ -218,6 +272,24 @@ def main(argv: "list[str] | None" = None) -> int:
             type(e).__name__, e,
         )
         return 1
+
+    # ── Режимы эксперимента: флаги CLI перекрывают ENV (spec 011) ──
+    # Значения читаются ядром бота из его глобальных переменных в момент ревью,
+    # поэтому присваивание здесь — рабочий и самый узкий способ их переопределить.
+    if args.dry_run:
+        pr_review_bot.DRY_RUN = True
+        pr_review_bot.DRY_RUN_DIR = args.out_dir
+    if args.context_mode:
+        pr_review_bot.REVIEW_CONTEXT_MODE = args.context_mode
+
+    # Баннер печатаем ВСЕГДА: по логу прогона должно быть однозначно видно, в каком
+    # режиме он шёл и писал ли что-то в PR. Иначе через неделю не отличить отчёты.
+    log.info(
+        "Режим: контекст=%s, dry-run=%s%s",
+        pr_review_bot.REVIEW_CONTEXT_MODE,
+        "ДА" if pr_review_bot.DRY_RUN else "нет",
+        f", отчёты в {pr_review_bot.DRY_RUN_DIR}" if pr_review_bot.DRY_RUN else "",
+    )
 
     # Токены проверяем ДО сетевых запросов — быстрый и понятный отказ.
     if not pr_review_bot.BITBUCKET_TOKEN:
