@@ -145,7 +145,17 @@ def parse_bitbucket_diff(diff_json: dict) -> list[dict]:
     """
     files: list[dict] = []
     for diff in diff_json.get("diffs", []):
-        path = diff.get("destination", {}).get("toString", "unknown")
+        # Обрабатываем случай "destination": null — это удалённый файл, у него нет
+        # целевой версии (TO-стороны), только source (FROM-сторона). .get(k, {}) от null
+        # НЕ спасает: ключ есть, значение None → .get("toString") падал AttributeError.
+        # Удалённый файл ревьюить нечего — добавленных строк в нём нет, пропускаем.
+        destination = diff.get("destination")
+        if destination is None:
+            source = diff.get("source", {}) or {}
+            path = source.get("toString", "unknown (deleted file)")
+            log.debug(f"⏭️ Пропускаем удалённый файл: {path}")
+            continue
+        path = destination.get("toString", "unknown")
         text_lines: list[str] = []
         added = 0
         for hunk in diff.get("hunks", []):
