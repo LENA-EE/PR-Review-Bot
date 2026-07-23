@@ -971,6 +971,12 @@ async def bitbucket_webhook(request: Request, background_tasks: BackgroundTasks)
     except Exception:
         return {"status": "error", "message": "invalid json"}
 
+    # Тело может быть валидным JSON, но НЕ объектом (массив, строка, число) —
+    # тогда payload.get(...) упал бы AttributeError ещё до разбора полей.
+    if not isinstance(payload, dict):
+        log.warning("⚠️ Webhook-payload не JSON-объект — пропускаю")
+        return {"status": "ignored", "message": "payload is not an object"}
+
     event = payload.get("eventKey", "")
     log.info(f"📨 Получен webhook: {event}")
 
@@ -984,25 +990,43 @@ async def bitbucket_webhook(request: Request, background_tasks: BackgroundTasks)
     if event not in ("pr:opened", "pr:from_ref_updated", "pr:modified"):
         return {"status": "ignored", "event": event}
 
-    pr        = payload.get("pullRequest", {})
-    pr_id     = pr.get("id")
-    repo      = pr.get("toRef", {}).get("repository", {})
-    repo_slug = repo.get("slug")
-    project_key = repo.get("project", {}).get("key")
+    # Разбор payload целиком под защитой: тело webhook — недоверенный ввод, поля
+    # приходят и отсутствующими, и явными null. Любой сюрприз в структуре должен стать
+    # безопасным ответом, а не HTTP 500: на 500 Bitbucket шлёт ретраи, а в PR при этом
+    # не появится даже сообщения об ошибке — ревью просто молча не поставится в очередь
+    # (обёртка в review_pull_request живёт глубже и сюда не достаёт).
+    try:
+        # ВНИМАНИЕ: .get(k, {}) подставляет {} только когда ключа НЕТ. Если ключ есть
+        # со значением null, вернётся None, и следующий .get упадёт AttributeError —
+        # ровно тот баг, что ронял разбор diff на удалённом файле. Поэтому везде `or {}`.
+        pr        = payload.get("pullRequest") or {}
+        pr_id     = pr.get("id")
+        to_ref    = pr.get("toRef") or {}
+        repo      = to_ref.get("repository") or {}
+        repo_slug = repo.get("slug")
+        project_key = (repo.get("project") or {}).get("key")
 
-    if not all([pr_id, repo_slug, project_key]):
-        log.error(f"Не хватает данных в webhook")
-        return {"status": "error", "message": "missing data"}
+        if not all([pr_id, repo_slug, project_key]):
+            log.error(
+                f"Не хватает данных в webhook: pr_id={pr_id}, repo={repo_slug}, "
+                f"project={project_key}"
+            )
+            return {"status": "error", "message": "missing data"}
 
-    # FROM-сторона (ветка PR): нужна для perlcritic — тянем полную новую версию файла.
-    # ref ДОЛЖЕН быть коммит-хешем (latestCommit), не displayId (M1: иначе версии разъедутся).
-    # raw-файл берём из репозитория ИСТОЧНИКА (для fork-PR он ≠ toRef); если fromRef нет —
-    # source_* останутся None, perlcritic-слой просто пропустится (деградация, не падение).
-    from_ref     = pr.get("fromRef", {}) or {}
-    source_ref   = from_ref.get("latestCommit")
-    source_repo_obj = from_ref.get("repository", {}) or {}
-    source_repo  = source_repo_obj.get("slug")
-    source_project = source_repo_obj.get("project", {}).get("key")
+        # FROM-сторона (ветка PR): нужна для perlcritic — тянем полную новую версию файла.
+        # ref ДОЛЖЕН быть коммит-хешем (latestCommit), не displayId (M1: иначе версии разъедутся).
+        # raw-файл берём из репозитория ИСТОЧНИКА (для fork-PR он ≠ toRef); если fromRef нет —
+        # source_* останутся None, perlcritic-слой просто пропустится (деградация, не падение).
+        from_ref     = pr.get("fromRef") or {}
+        source_ref   = from_ref.get("latestCommit")
+        source_repo_obj = from_ref.get("repository") or {}
+        source_repo  = source_repo_obj.get("slug")
+        source_project = (source_repo_obj.get("project") or {}).get("key")
+    except Exception as e:
+        log.error(
+            f"❌ Не смог разобрать webhook-payload ({type(e).__name__}: {e}) — пропускаю"
+        )
+        return {"status": "ignored", "message": "malformed payload"}
 
     # Возвращаем 200 немедленно — ревью выполняется в фоне
     background_tasks.add_task(
