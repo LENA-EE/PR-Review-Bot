@@ -24,6 +24,8 @@ from typing import Optional
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("jarvis-pr-review")
+# Отключаем SSL-предупреждения urllib3 (внутренние сервисы с self-signed сертификатами)
+logging.getLogger("urllib3").setLevel(logging.ERROR)
 
 # Inspector-слой (spec 004): perlcritic через mcp-drospr + детерминированный styleguide-grep.
 # Импортируем мягко: если соседних модулей нет (напр. деплой только pr_review_bot.py),
@@ -84,7 +86,7 @@ PERLCRITIC_SEVERITY_WARNING_MIN = int(os.getenv("PERLCRITIC_SEVERITY_WARNING_MIN
 # Лимит [perlcritic]-комментариев на PR — не затопить ревью (M5).
 PERLCRITIC_MAX_COMMENTS = int(os.getenv("PERLCRITIC_MAX_COMMENTS", "10"))
 
-# ── Inspector: детерминированный styleguide-grep (метка [styleguide]) ──
+# ── Inspector: детерминированный styleguide-grep (метка [codestyle]) ──
 # Правила команды в примонтированном файле (hot-reload, без ребилда).
 STYLEGUIDE_RULES_PATH    = os.getenv("STYLEGUIDE_RULES_PATH", "/app/styleguide_rules.txt")
 STYLEGUIDE_RULES_ENABLED = os.getenv("STYLEGUIDE_RULES_ENABLED", "1") == "1"
@@ -147,8 +149,29 @@ def get_pr_diff(project: str, repo: str, pr_id: int) -> list[dict]:
         f"/pull-requests/{pr_id}/diff"
     )
     resp = requests.get(url, headers=bb_headers(), timeout=30, verify=False)
-    resp.raise_for_status()
-    return parse_bitbucket_diff(resp.json())
+    # Логируем статус ответа для отладки
+    log.debug(f"Bitbucket API status: {resp.status_code}")
+    # Разбираем тело сами (без raise_for_status): при ошибке Bitbucket кладёт
+    # в JSON внятное errors[].message — вытаскиваем его вместо голого HTTP-кода.
+    try:
+        diff_json = resp.json()
+    except json.JSONDecodeError as e:
+        log.error(f"Bitbucket API вернул не JSON: {e}")
+        log.error(f"Response body: {resp.text[:500]}")
+        raise ValueError(f"Bitbucket API вернул некорректный ответ для PR #{pr_id}")
+    if diff_json is None:
+        log.error(f"Bitbucket API вернул пустой ответ (None) для PR #{pr_id}")
+        raise ValueError(f"Bitbucket API вернул пустой ответ для PR #{pr_id}")
+    # Проверяем наличие ключа "diffs"
+    if "diffs" not in diff_json:
+        errors = diff_json.get("errors", [])
+        if errors:
+            msg = errors[0].get("message", "Неизвестная ошибка Bitbucket API")
+            log.error(f"Bitbucket API вернул ошибку: {msg}")
+            raise ValueError(f"Bitbucket API: {msg}")
+        log.error(f"Bitbucket API вернул ответ без 'diffs': {diff_json}")
+        raise ValueError(f"Bitbucket API: ответ не содержит ключ 'diffs'")
+    return parse_bitbucket_diff(diff_json)
 
 
 def parse_bitbucket_diff(diff_json: dict) -> list[dict]:
@@ -305,10 +328,11 @@ def get_existing_comment_keys(project: str, repo: str, pr_id: int) -> set:
 
 # ── Феникс API ──────────────────────────────────────────────
 
-# Стайлгайд — загружается из файла если есть
-# Файл кладётся на сервере: /app/styleguide.md
-# Обновляется вручную или скриптом из Confluence
-STYLEGUIDE_PATH = "/app/styleguide.md"
+# Стайлгайд — загружается из файла если есть.
+# Дефолт ./styleguide.md — рядом с ботом: работает и при запуске скриптом (банковская
+# VM без Docker), и в контейнере (WORKDIR /app). Другое место — через ENV, не правкой кода.
+# Обновляется вручную или скриптом из Confluence.
+STYLEGUIDE_PATH = os.getenv("STYLEGUIDE_PATH", "./styleguide.md")
 
 def load_styleguide() -> str:
     try:
@@ -773,12 +797,13 @@ def _inspect_file(
                     })
                     facts.append(f"{path}:{iss.get('line')} [{policy}] {msg}")
 
-    # ── styleguide-grep (детерминированные правила команды) ──
-    if sg_rules:
+    # ── styleguide-grep (детерминированные правила команды, только Perl-файлы) ──
+    # Метка источника — [codestyle]: так договорились в команде (решение Ярослава).
+    if sg_rules and _perl_file(path):
         for finding in styleguide_rules.scan(f["text"], sg_rules):
             comments.append({
                 "file": path, "line": finding["line"], "severity": finding["severity"],
-                "source": "styleguide", "body": finding["message"],
+                "source": "codestyle", "body": finding["message"],
             })
 
     return comments, facts, mcp_unavailable
@@ -1033,7 +1058,7 @@ def _do_review(
     warnings = sum(1 for c in all_comments if c.get("severity") == "warning")
     tips     = sum(1 for c in all_comments if c.get("severity") == "suggestion")
     by_perlcritic = sum(1 for c in all_comments if c.get("source") == "perlcritic")
-    by_styleguide = sum(1 for c in all_comments if c.get("source") == "styleguide")
+    by_codestyle  = sum(1 for c in all_comments if c.get("source") == "codestyle")
     by_jarvis     = sum(1 for c in all_comments if c.get("source") == "JARVIS")
 
     summary = (
@@ -1043,7 +1068,7 @@ def _do_review(
         f"🟡 Предупреждений: {warnings} · "
         f"💡 Подсказок: {tips}\n\n"
         f"Источники: `[perlcritic]` {by_perlcritic} · "
-        f"`[styleguide]` {by_styleguide} · `[JARVIS]` {by_jarvis}\n\n"
+        f"`[codestyle]` {by_codestyle} · `[JARVIS]` {by_jarvis}\n\n"
         f"_Это автоматическое ревью. Обязательна проверка сеньором._"
         + failed_note
     )
