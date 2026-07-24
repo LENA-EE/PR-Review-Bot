@@ -1072,8 +1072,10 @@ def _title_is_draft(title: str) -> bool:
         return False
     head = title.strip()
     for marker in WIP_MARKERS:
-        # ^[скобка]? маркер \b — маркер в начале, дальше не буква/цифра.
-        if re.match(rf"[\[(]?\s*{re.escape(marker)}\b", head, re.IGNORECASE):
+        # ^[скобка]? маркер, а дальше — конец строки или РАЗДЕЛИТЕЛЬ из FR-002:
+        # пробел, `:`, `)`, `]`. Дефис НЕ разделитель — иначе тикет-префикс вида
+        # "WIP-4821: fix" ложно считался бы черновиком. "Wiper module" — тоже не он.
+        if re.match(rf"[\[(]?\s*{re.escape(marker)}(?=[\s:)\]]|$)", head, re.IGNORECASE):
             return True
     return False
 
@@ -1182,22 +1184,12 @@ async def bitbucket_webhook(request: Request, background_tasks: BackgroundTasks)
                     )
                 return {"status": "skipped", "reason": "draft", "pr_id": pr_id}
 
-            # FR-011: правку метаданных уже готового PR (описание/ревьюеры, а не
-            # снятие метки) повторно не ревьюим — экономим бюджет Феникса. Fail-safe:
-            # нет previousTitle → ревьюим (лишний прогон гасит дедуп), чтобы
-            # отсутствие поля не сломало основной триггер снятия метки.
-            if event == "pr:modified":
-                previous_title = payload.get("previousTitle")
-                if previous_title is not None and not _title_is_draft(previous_title):
-                    log.info(
-                        f"⏭️ PR #{pr_id}: правка метаданных готового PR "
-                        f"(не снятие метки) — ревью не требуется"
-                    )
-                    return {
-                        "status": "skipped",
-                        "reason": "metadata-edit",
-                        "pr_id": pr_id,
-                    }
+            # FR-011 (переопределён по ревью): на pr:modified готового PR ревью НЕ
+            # пропускаем. Тот же заголовок приходит и на правку описания, и на РЕТАРГЕТ
+            # целевой ветки (там diff меняется полностью) — отличить их по заголовку без
+            # доп. полей payload нельзя, а молча пропустить ретаргет опаснее лишнего
+            # прогона. Дубли комментариев гасит дедуп (REV-003). Экономию Феникса на
+            # косметических правках вернём как проверенную оптимизацию на живом вебхуке.
 
         # FROM-сторона (ветка PR): нужна для perlcritic — тянем полную новую версию файла.
         # ref ДОЛЖЕН быть коммит-хешем (latestCommit), не displayId (M1: иначе версии разъедутся).
