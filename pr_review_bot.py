@@ -110,6 +110,9 @@ WIP_MARKERS = [
     for m in os.getenv("WIP_MARKERS", "WIP").split(",")
     if m.strip()
 ]
+# Разовое сообщение в PR «вижу черновик, жду снятия метки» (spec 010, В-4).
+# Идемпотентно (дедуп) и best-effort; WIP_NOTIFY_ENABLED=0 отключает уведомление.
+WIP_NOTIFY_ENABLED = os.getenv("WIP_NOTIFY_ENABLED", "1") == "1"
 # ────────────────────────────────────────────────────────────
 
 
@@ -1075,6 +1078,38 @@ def _title_is_draft(title: str) -> bool:
     return False
 
 
+def _wip_notify_text() -> str:
+    """Текст разового уведомления «PR — черновик, жду снятия метки»."""
+    markers = ", ".join(f"`{m.upper()}`" for m in WIP_MARKERS) or "`WIP`"
+    return (
+        "🤖 **JARVIS**: этот PR помечен как черновик — автоматическое ревью на паузе.\n\n"
+        f"Когда код будет готов, уберите метку черновика ({markers}) из начала "
+        "заголовка PR. Правка заголовка и станет сигналом «готово к ревью» — бот "
+        "сразу проверит весь PR целиком.\n\n"
+        "_Пока метка стоит, бот не тратит ресурсы на промежуточные версии._"
+    )
+
+
+def notify_draft_pending(project: str, repo: str, pr_id: int) -> None:
+    """Разово сообщает в PR, что бот увидел черновик и ждёт снятия метки (В-4).
+
+    Идемпотентно: если такой комментарий уже висит — молчим (stateless-дедуп по
+    существующим комментариям PR, тот же принцип, что гасит повторы ревью).
+    Best-effort: любая ошибка логируется, но не влияет на обработку webhook —
+    уведомление вторично по отношению к самому гейту (graceful, AES §7.3).
+    """
+    try:
+        text = _wip_notify_text()
+        existing = get_existing_comment_keys(project, repo, pr_id)
+        if _comment_key(None, None, text) in existing:
+            log.info(f"⏭️ PR #{pr_id}: уведомление о черновике уже есть — не повторяю")
+            return
+        post_general_comment(project, repo, pr_id, text)
+        log.info(f"💬 PR #{pr_id}: сообщил, что жду снятия метки черновика")
+    except Exception as e:
+        log.warning(f"Не смог оставить уведомление о черновике в PR #{pr_id}: {e}")
+
+
 @app.post("/webhook")
 async def bitbucket_webhook(request: Request, background_tasks: BackgroundTasks):
     """Принимает webhook от Bitbucket."""
@@ -1137,6 +1172,14 @@ async def bitbucket_webhook(request: Request, background_tasks: BackgroundTasks)
                     f"⏸️ PR #{pr_id}: черновик (заголовок {title!r}) — "
                     f"ревью отложено до снятия метки"
                 )
+                # В-4: разово сообщаем автору, что бот ждёт снятия метки. Только на
+                # «сигнальных» событиях (открытие/правка заголовка), НЕ на каждом
+                # черновом пуше — иначе на PR со 150 коммитами это 150 лишних GET к
+                # Bitbucket. Повтор внутри тоже гасится дедупом (пояс и подтяжки).
+                if WIP_NOTIFY_ENABLED and event in ("pr:opened", "pr:modified"):
+                    background_tasks.add_task(
+                        notify_draft_pending, project_key, repo_slug, pr_id
+                    )
                 return {"status": "skipped", "reason": "draft", "pr_id": pr_id}
 
             # FR-011: правку метаданных уже готового PR (описание/ревьюеры, а не
