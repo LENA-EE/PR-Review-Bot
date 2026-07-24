@@ -13,6 +13,7 @@ JARVIS PR Review Bot
 """
 
 import os
+import re
 import json
 import time
 import threading
@@ -94,6 +95,21 @@ STYLEGUIDE_RULES_ENABLED = os.getenv("STYLEGUIDE_RULES_ENABLED", "1") == "1"
 # IMPACT_ENABLED=0 ИЛИ пустой MCP_DROSPR_URL → слой выключен (graceful default).
 IMPACT_ENABLED     = os.getenv("IMPACT_ENABLED", "0") == "1"
 IMPACT_MAX_SYMBOLS = int(os.getenv("IMPACT_MAX_SYMBOLS", "20"))
+
+# ── WIP-гейт: ревью запускается, когда автор снял метку черновика (spec 010) ──
+# «Я готов» — состояние в голове разработчика, не событие в Bitbucket. Пока в
+# ЗАГОЛОВКЕ PR стоит маркер (по умолчанию WIP), бот молчит: не зовёт Феникс, не
+# постит комментарии. Снятие маркера = правка заголовка = событие pr:modified,
+# на которое бот уже подписан. opt-out: без маркера PR ревьюится как раньше.
+# Kill switch: WIP_GATING_ENABLED=0 → прежнее поведение (.env + рестарт, без кода).
+WIP_GATING_ENABLED = os.getenv("WIP_GATING_ENABLED", "1") == "1"
+# Маркеры черновика — команда меняет договорённость через ENV без правки кода.
+# Сравнение регистронезависимое и по границе слова (Wiper module ≠ черновик).
+WIP_MARKERS = [
+    m.strip().lower()
+    for m in os.getenv("WIP_MARKERS", "WIP").split(",")
+    if m.strip()
+]
 # ────────────────────────────────────────────────────────────
 
 
@@ -1041,6 +1057,24 @@ def _do_review(
 
 # ── Webhook endpoint ────────────────────────────────────────
 
+def _title_is_draft(title: str) -> bool:
+    """PR — черновик, если заголовок начинается с WIP-маркера.
+
+    Регистронезависимо; допускаются обрамляющие скобки и разделитель
+    (`WIP:`, `[WIP]`, `(wip) …`). Совпадение по ГРАНИЦЕ СЛОВА — заголовки
+    `Wiper module`, `Drafting API` черновиком НЕ считаются (FR-010).
+    Пустой/нечитаемый заголовок → не черновик (fail-open, FR-009).
+    """
+    if not isinstance(title, str) or not title.strip():
+        return False
+    head = title.strip()
+    for marker in WIP_MARKERS:
+        # ^[скобка]? маркер \b — маркер в начале, дальше не буква/цифра.
+        if re.match(rf"[\[(]?\s*{re.escape(marker)}\b", head, re.IGNORECASE):
+            return True
+    return False
+
+
 @app.post("/webhook")
 async def bitbucket_webhook(request: Request, background_tasks: BackgroundTasks):
     """Принимает webhook от Bitbucket."""
@@ -1090,6 +1124,37 @@ async def bitbucket_webhook(request: Request, background_tasks: BackgroundTasks)
                 f"project={project_key}"
             )
             return {"status": "error", "message": "missing data"}
+
+        # ── WIP-гейт (spec 010): не ревьюим черновик ─────────────
+        # «Готов к ревью» — состояние в голове автора, а не событие в Bitbucket.
+        # Делаем его событием: пока в ЗАГОЛОВКЕ PR стоит маркер (WIP) — молчим;
+        # снятие маркера = правка заголовка = pr:modified (уже подписаны) = запуск.
+        if WIP_GATING_ENABLED:
+            title = pr.get("title") or ""
+            # FR-003: уважаем нативный признак черновика, если Bitbucket его шлёт.
+            if pr.get("draft") is True or _title_is_draft(title):
+                log.info(
+                    f"⏸️ PR #{pr_id}: черновик (заголовок {title!r}) — "
+                    f"ревью отложено до снятия метки"
+                )
+                return {"status": "skipped", "reason": "draft", "pr_id": pr_id}
+
+            # FR-011: правку метаданных уже готового PR (описание/ревьюеры, а не
+            # снятие метки) повторно не ревьюим — экономим бюджет Феникса. Fail-safe:
+            # нет previousTitle → ревьюим (лишний прогон гасит дедуп), чтобы
+            # отсутствие поля не сломало основной триггер снятия метки.
+            if event == "pr:modified":
+                previous_title = payload.get("previousTitle")
+                if previous_title is not None and not _title_is_draft(previous_title):
+                    log.info(
+                        f"⏭️ PR #{pr_id}: правка метаданных готового PR "
+                        f"(не снятие метки) — ревью не требуется"
+                    )
+                    return {
+                        "status": "skipped",
+                        "reason": "metadata-edit",
+                        "pr_id": pr_id,
+                    }
 
         # FROM-сторона (ветка PR): нужна для perlcritic — тянем полную новую версию файла.
         # ref ДОЛЖЕН быть коммит-хешем (latestCommit), не displayId (M1: иначе версии разъедутся).
