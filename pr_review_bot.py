@@ -13,6 +13,7 @@ JARVIS PR Review Bot
 """
 
 import os
+import re
 import json
 import time
 import threading
@@ -94,6 +95,24 @@ STYLEGUIDE_RULES_ENABLED = os.getenv("STYLEGUIDE_RULES_ENABLED", "1") == "1"
 # IMPACT_ENABLED=0 ИЛИ пустой MCP_DROSPR_URL → слой выключен (graceful default).
 IMPACT_ENABLED     = os.getenv("IMPACT_ENABLED", "0") == "1"
 IMPACT_MAX_SYMBOLS = int(os.getenv("IMPACT_MAX_SYMBOLS", "20"))
+
+# ── WIP-гейт: ревью запускается, когда автор снял метку черновика (spec 010) ──
+# «Я готов» — состояние в голове разработчика, не событие в Bitbucket. Пока в
+# ЗАГОЛОВКЕ PR стоит маркер (по умолчанию WIP), бот молчит: не зовёт Феникс, не
+# постит комментарии. Снятие маркера = правка заголовка = событие pr:modified,
+# на которое бот уже подписан. opt-out: без маркера PR ревьюится как раньше.
+# Kill switch: WIP_GATING_ENABLED=0 → прежнее поведение (.env + рестарт, без кода).
+WIP_GATING_ENABLED = os.getenv("WIP_GATING_ENABLED", "1") == "1"
+# Маркеры черновика — команда меняет договорённость через ENV без правки кода.
+# Сравнение регистронезависимое и по границе слова (Wiper module ≠ черновик).
+WIP_MARKERS = [
+    m.strip().lower()
+    for m in os.getenv("WIP_MARKERS", "WIP").split(",")
+    if m.strip()
+]
+# Разовое сообщение в PR «вижу черновик, жду снятия метки» (spec 010, В-4).
+# Идемпотентно (дедуп) и best-effort; WIP_NOTIFY_ENABLED=0 отключает уведомление.
+WIP_NOTIFY_ENABLED = os.getenv("WIP_NOTIFY_ENABLED", "1") == "1"
 # ────────────────────────────────────────────────────────────
 
 
@@ -1041,6 +1060,58 @@ def _do_review(
 
 # ── Webhook endpoint ────────────────────────────────────────
 
+def _title_is_draft(title: str) -> bool:
+    """PR — черновик, если заголовок начинается с WIP-маркера.
+
+    Регистронезависимо; допускаются обрамляющие скобки и разделитель
+    (`WIP:`, `[WIP]`, `(wip) …`). Совпадение по ГРАНИЦЕ СЛОВА — заголовки
+    `Wiper module`, `Drafting API` черновиком НЕ считаются (FR-010).
+    Пустой/нечитаемый заголовок → не черновик (fail-open, FR-009).
+    """
+    if not isinstance(title, str) or not title.strip():
+        return False
+    head = title.strip()
+    for marker in WIP_MARKERS:
+        # ^[скобка]? маркер, а дальше — конец строки или РАЗДЕЛИТЕЛЬ из FR-002:
+        # пробел, `:`, `)`, `]`. Дефис НЕ разделитель — иначе тикет-префикс вида
+        # "WIP-4821: fix" ложно считался бы черновиком. "Wiper module" — тоже не он.
+        if re.match(rf"[\[(]?\s*{re.escape(marker)}(?=[\s:)\]]|$)", head, re.IGNORECASE):
+            return True
+    return False
+
+
+def _wip_notify_text() -> str:
+    """Текст разового уведомления «PR — черновик, жду снятия метки»."""
+    markers = ", ".join(f"`{m.upper()}`" for m in WIP_MARKERS) or "`WIP`"
+    return (
+        "🤖 **JARVIS**: этот PR помечен как черновик — автоматическое ревью на паузе.\n\n"
+        f"Когда код будет готов, уберите метку черновика ({markers}) из начала "
+        "заголовка PR. Правка заголовка и станет сигналом «готово к ревью» — бот "
+        "сразу проверит весь PR целиком.\n\n"
+        "_Пока метка стоит, бот не тратит ресурсы на промежуточные версии._"
+    )
+
+
+def notify_draft_pending(project: str, repo: str, pr_id: int) -> None:
+    """Разово сообщает в PR, что бот увидел черновик и ждёт снятия метки (В-4).
+
+    Идемпотентно: если такой комментарий уже висит — молчим (stateless-дедуп по
+    существующим комментариям PR, тот же принцип, что гасит повторы ревью).
+    Best-effort: любая ошибка логируется, но не влияет на обработку webhook —
+    уведомление вторично по отношению к самому гейту (graceful, AES §7.3).
+    """
+    try:
+        text = _wip_notify_text()
+        existing = get_existing_comment_keys(project, repo, pr_id)
+        if _comment_key(None, None, text) in existing:
+            log.info(f"⏭️ PR #{pr_id}: уведомление о черновике уже есть — не повторяю")
+            return
+        post_general_comment(project, repo, pr_id, text)
+        log.info(f"💬 PR #{pr_id}: сообщил, что жду снятия метки черновика")
+    except Exception as e:
+        log.warning(f"Не смог оставить уведомление о черновике в PR #{pr_id}: {e}")
+
+
 @app.post("/webhook")
 async def bitbucket_webhook(request: Request, background_tasks: BackgroundTasks):
     """Принимает webhook от Bitbucket."""
@@ -1090,6 +1161,35 @@ async def bitbucket_webhook(request: Request, background_tasks: BackgroundTasks)
                 f"project={project_key}"
             )
             return {"status": "error", "message": "missing data"}
+
+        # ── WIP-гейт (spec 010): не ревьюим черновик ─────────────
+        # «Готов к ревью» — состояние в голове автора, а не событие в Bitbucket.
+        # Делаем его событием: пока в ЗАГОЛОВКЕ PR стоит маркер (WIP) — молчим;
+        # снятие маркера = правка заголовка = pr:modified (уже подписаны) = запуск.
+        if WIP_GATING_ENABLED:
+            title = pr.get("title") or ""
+            # FR-003: уважаем нативный признак черновика, если Bitbucket его шлёт.
+            if pr.get("draft") is True or _title_is_draft(title):
+                log.info(
+                    f"⏸️ PR #{pr_id}: черновик (заголовок {title!r}) — "
+                    f"ревью отложено до снятия метки"
+                )
+                # В-4: разово сообщаем автору, что бот ждёт снятия метки. Только на
+                # «сигнальных» событиях (открытие/правка заголовка), НЕ на каждом
+                # черновом пуше — иначе на PR со 150 коммитами это 150 лишних GET к
+                # Bitbucket. Повтор внутри тоже гасится дедупом (пояс и подтяжки).
+                if WIP_NOTIFY_ENABLED and event in ("pr:opened", "pr:modified"):
+                    background_tasks.add_task(
+                        notify_draft_pending, project_key, repo_slug, pr_id
+                    )
+                return {"status": "skipped", "reason": "draft", "pr_id": pr_id}
+
+            # FR-011 (переопределён по ревью): на pr:modified готового PR ревью НЕ
+            # пропускаем. Тот же заголовок приходит и на правку описания, и на РЕТАРГЕТ
+            # целевой ветки (там diff меняется полностью) — отличить их по заголовку без
+            # доп. полей payload нельзя, а молча пропустить ретаргет опаснее лишнего
+            # прогона. Дубли комментариев гасит дедуп (REV-003). Экономию Феникса на
+            # косметических правках вернём как проверенную оптимизацию на живом вебхуке.
 
         # FROM-сторона (ветка PR): нужна для perlcritic — тянем полную новую версию файла.
         # ref ДОЛЖЕН быть коммит-хешем (latestCommit), не displayId (M1: иначе версии разъедутся).
