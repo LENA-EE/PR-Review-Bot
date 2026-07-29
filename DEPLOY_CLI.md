@@ -21,7 +21,7 @@ git clone https://<BANK_BITBUCKET_URL>/scm/<PROJECT>/<REPO>.git
 cd <REPO>
 
 # 2. Прибиваешь корп-identity для этого клона (чтобы не утекла личная почта)
-git config user.email "ты@gazprombank.ru"
+git config user.email "<ТЫ>@<КОРП_ДОМЕН>"
 git config user.name "Имя Фамилия"
 
 # 3. Создаёшь новую папку под консольную версию
