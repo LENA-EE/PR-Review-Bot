@@ -58,13 +58,13 @@ FENIX_MODEL = os.getenv("FENIX_MODEL", "DeepSeek V3.2")
 MAX_DIFF_LINES = int(os.getenv("MAX_DIFF_LINES", "400"))
 
 # Лимит длины ответа модели. 4096 с запасом для ревью (10 коротких замечаний),
-# а 16384 раньше провоцировал таймаут и зря бронировал бюджет Феникса (~700k ток/мин).
+# а 16384 раньше провоцировал таймаут и зря бронировал бюджет Феникса (~500k ток/мин).
 FENIX_MAX_TOKENS = int(os.getenv("FENIX_MAX_TOKENS", "4096"))
 # Таймаут запроса к Фениксу (сек). Не путать с webhook: бот отвечает Bitbucket 200
 # сразу, ревью идёт в фоне — этот таймаут на webhook не влияет.
 FENIX_TIMEOUT = int(os.getenv("FENIX_TIMEOUT", "90"))
 # Сколько ревью могут обращаться к Фениксу одновременно. 1 = строго по очереди:
-# при бёрсте PR не уходим в параллельный спайк по лимиту 700k токенов/мин.
+# при бёрсте PR не уходим в параллельный спайк по лимиту 500k токенов/мин.
 FENIX_MAX_CONCURRENCY = int(os.getenv("FENIX_MAX_CONCURRENCY", "1"))
 FENIX_SEMAPHORE = threading.BoundedSemaphore(FENIX_MAX_CONCURRENCY)
 # Сколько раз повторить запрос к Фениксу при таймауте/429. 0 = выключить ретраи.
@@ -495,7 +495,7 @@ def _fenix_request_with_retry(endpoint: str, payload: dict):
     """POST в Феникс с ретраями. Возвращает Response или None (причина залогирована).
 
     Ретраим:
-      - 429 (лимит ~700k ток/мин) — ждём Retry-After (или экспоненциальный backoff)
+      - 429 (лимит ~500k ток/мин на пользователя) — ждём Retry-After (или экспоненциальный backoff)
         и повторяем; здесь ретрай реально помогает, лимит поминутный;
       - таймаут — мягкая подстраховка от разового блипа; устойчивый пик так НЕ лечится
         (для этого снижен max_tokens), поэтому попыток немного.
@@ -538,7 +538,7 @@ def _fenix_request_with_retry(endpoint: str, payload: dict):
             retry_after = e.response.headers.get("Retry-After") if e.response is not None else None
             if last:
                 log.error(
-                    f"🚦 Феникс: лимит токенов (HTTP 429, ~700k ток/мин), попытки исчерпаны. "
+                    f"🚦 Феникс: лимит токенов (HTTP 429, ~500k ток/мин), попытки исчерпаны. "
                     f"Retry-After={retry_after or 'не указан'}. Что попробовать: снизить "
                     f"FENIX_MAX_TOKENS ({FENIX_MAX_TOKENS}) или FENIX_MAX_CONCURRENCY "
                     f"({FENIX_MAX_CONCURRENCY})."
@@ -597,7 +597,7 @@ def ask_fenix(
     }
 
     # Сериализуем обращения к Фениксу (см. FENIX_SEMAPHORE). При бёрсте PR
-    # ревью встают в очередь, а не бьют по лимиту 700k ток/мин одновременно.
+    # ревью встают в очередь, а не бьют по лимиту 500k ток/мин одновременно.
     if not FENIX_SEMAPHORE.acquire(blocking=False):
         log.info("⏳ Жду свободный слот Феникса (идёт другое ревью)...")
         FENIX_SEMAPHORE.acquire()
