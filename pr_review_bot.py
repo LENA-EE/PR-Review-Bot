@@ -376,7 +376,9 @@ def load_styleguide() -> str:
 #   4) служебные маркеры вырезаются из данных, чтобы текст внутри не «закрыл» блок.
 # Это не делает инъекцию невозможной, но радиус мал: токен — только Repo:Read+PR:Write,
 # секретов в промпте нет, выход зажат JSON-форматом.
-STYLEGUIDE_MAX_CHARS = 8000
+# Потолок символов стайлгайда в промпте. Крутится через .env без пересборки:
+# правила с границами применения и few-shot примерами длиннее голых правил.
+STYLEGUIDE_MAX_CHARS = int(os.getenv("STYLEGUIDE_MAX_CHARS", "24000"))
 _DATA_MARKERS = (
     "«STYLEGUIDE»", "«/STYLEGUIDE»", "«DIFF»", "«/DIFF»",
     "«PERLCRITIC»", "«/PERLCRITIC»",
