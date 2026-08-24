@@ -42,6 +42,15 @@ except ImportError as _e:
     log.warning(f"Inspector-модули недоступны ({_e}) — ревью только Фениксом")
     INSPECTOR_AVAILABLE = False
 
+# Фильтр публикации (spec 016) деградирует ОТДЕЛЬНО от Inspector-слоя: если
+# модуля рядом нет, бот постит всё как раньше, а не отключает perlcritic заодно.
+try:
+    import review_prefs
+    REVIEW_PREFS_AVAILABLE = True
+except ImportError as _e:
+    log.warning(f"review_prefs недоступен ({_e}) — публикуется всё найденное")
+    REVIEW_PREFS_AVAILABLE = False
+
 app = FastAPI()
 
 # ── Настройки — берутся из ENV, токенов в коде нет ─────────
@@ -143,6 +152,22 @@ REVIEW_FILE_MAX_CHARS = int(os.getenv("REVIEW_FILE_MAX_CHARS", "120000"))
 # Остальные сворачиваются в «и ещё N» — иначе на PR с десятками таких файлов
 # пометка превращается в простыню и перестаёт читаться.
 COVERAGE_MAX_LISTED = int(os.getenv("COVERAGE_MAX_LISTED", "10"))
+
+# ── Что публиковать: порог важности и метка автора (spec 016) ──
+# Базовый уровень для всего развёртывания. Автор PR может РАСШИРИТЬ его меткой
+# в описании; сузить ниже error нельзя — критичное видно всегда (FR-012).
+# Расширение, а не сужение, выбрано намеренно: фильтр не работает задним числом,
+# удалять уже опубликованное бот не может, и сужающая метка приходила бы поздно.
+POST_MIN_SEVERITY = os.getenv("POST_MIN_SEVERITY", "warning").strip().lower()
+if POST_MIN_SEVERITY not in ("error", "warning", "suggestion"):
+    log.warning(
+        f"⚠️ POST_MIN_SEVERITY={POST_MIN_SEVERITY!r} не распознан "
+        f"(ожидалось error|warning|suggestion) — работаю на уровне warning."
+    )
+    POST_MIN_SEVERITY = "warning"
+# Имя в метке. В ENV, а не в коде: хардкод конфигурации запрещён (CLAUDE.md §8),
+# и если заведут сервисную учётку с таким логином, менять придётся не код.
+JARVIS_MARKER = os.getenv("JARVIS_MARKER", "@jarvis").strip() or "@jarvis"
 
 # ── Фильтр замечаний LLM по изменённым строкам ────────────────
 # Для perlcritic такая защита есть с самого начала (diff_filter.filter_issues_by_lines),
@@ -952,6 +977,7 @@ def review_pull_request(
     source_project: Optional[str] = None,
     source_repo: Optional[str] = None,
     source_ref: Optional[str] = None,
+    description: Optional[str] = None,
 ):
     """Полный цикл ревью одного PR.
 
@@ -959,10 +985,15 @@ def review_pull_request(
     source_* — FROM-сторона (ветка PR): оттуда тянем ПОЛНУЮ новую версию файла для
     perlcritic (M1: raw из fromRef.repository + fromRef.latestCommit, НЕ toRef). Для
     same-repo PR совпадают, для fork-PR расходятся.
+
+    description — описание PR: оттуда читается метка @jarvis (spec 016). Параметр
+    необязательный, чтобы старые вызовы продолжали работать на дефолтном уровне.
     """
     log.info(f"🔍 Начинаю ревью PR #{pr_id} в {project}/{repo}")
     try:
-        _do_review(project, repo, pr_id, source_project, source_repo, source_ref)
+        _do_review(
+            project, repo, pr_id, source_project, source_repo, source_ref, description,
+        )
     except Exception as e:
         log.error(f"❌ Ошибка ревью PR #{pr_id}: {e}")
         try:
@@ -1120,6 +1151,7 @@ def _do_review(
     source_project: Optional[str] = None,
     source_repo: Optional[str] = None,
     source_ref: Optional[str] = None,
+    description: Optional[str] = None,
 ):
     """Внутренняя логика ревью."""
     # 1. Забираем diff, разбитый по файлам
@@ -1365,6 +1397,46 @@ def _do_review(
         kept.append(c)
     all_comments = kept
 
+    # ── Что из найденного публикуем (spec 016) ──────────────────
+    # ЕДИНСТВЕННАЯ точка отсечения. Всё, что идёт мимо неё (уведомление о
+    # черновике, пометки о покрытии, сама сводка), защищено от фильтра по
+    # построению, а не списком исключений.
+    #
+    # all_comments НЕ урезаем: счётчики в сводке должны считать НАЙДЕННОЕ,
+    # иначе строка «скрыто 14» противоречила бы соседним цифрам (FR-020).
+    if REVIEW_PREFS_AVAILABLE:
+        prefs = review_prefs.parse_marker(description, POST_MIN_SEVERITY, JARVIS_MARKER)
+    else:
+        prefs = None
+
+    visible: list[dict] = []
+    hidden_by_level = 0
+    hidden_by_source = 0
+    for c in all_comments:
+        if prefs is None:
+            visible.append(c)
+            continue
+        if review_prefs.should_post(prefs, c.get("severity"), c.get("source")):
+            visible.append(c)
+            continue
+        # Разделяем причины: автору полезно знать, поднять ли порог или снять минус.
+        if (c.get("source") or "").strip().lower() in prefs.excluded_sources:
+            hidden_by_source += 1
+        else:
+            hidden_by_level += 1
+
+    if prefs is not None:
+        log.info(
+            f"🎚️ Фильтр публикации: {prefs.level_word}, исключено "
+            f"{sorted(prefs.excluded_sources) or '—'}; показываю {len(visible)} "
+            f"из {len(all_comments)} найденных"
+        )
+
+    filter_note = (
+        review_prefs.describe(prefs, hidden_by_level, hidden_by_source)
+        if prefs is not None else ""
+    )
+
     # Блок затрат: цифры для аллокации бюджета Феникса. Показываем только когда
     # запросы реально были — на PR, разобранном одним Inspector'ом, нули не нужны.
     token_block = ""
@@ -1462,6 +1534,7 @@ def _do_review(
         no_issues = (
             "🤖 **JARVIS Review**: Проверка завершена — замечаний нет! 🎉\n\n"
             "✅ Код чистый, придраться не к чему. Отличная работа! 👏\n\n"
+            f"{filter_note}\n\n"
             f"{token_block}"
             "_Это автоматическое ревью, финальное слово за сеньором "
             "(ИИ пока не заменит кожаных 🧠)._"
@@ -1482,7 +1555,7 @@ def _do_review(
 
     posted = 0
     skipped = 0
-    for item in all_comments:
+    for item in visible:
         emoji = severity_emoji.get(item.get("severity", "suggestion"), "💡")
         source = item.get("source", "JARVIS")
         text = (
@@ -1534,6 +1607,7 @@ def _do_review(
         f"💡 Подсказок: {tips}\n\n"
         f"Источники: `[perlcritic]` {by_perlcritic} · "
         f"`[codestyle]` {by_codestyle} · `[JARVIS]` {by_jarvis}\n\n"
+        f"{filter_note}\n\n"
         f"{token_block}"
         f"_Это автоматическое ревью. Обязательна проверка сеньором._"
         + failed_note
@@ -1701,7 +1775,7 @@ async def bitbucket_webhook(request: Request, background_tasks: BackgroundTasks)
     # Возвращаем 200 немедленно — ревью выполняется в фоне
     background_tasks.add_task(
         review_pull_request, project_key, repo_slug, pr_id,
-        source_project, source_repo, source_ref,
+        source_project, source_repo, source_ref, pr.get("description"),
     )
     return {"status": "ok", "pr_id": pr_id}
 

@@ -349,6 +349,9 @@ def main(argv: "list[str] | None" = None) -> int:
         pr_review_bot.review_pull_request(
             project, repo, pr_id,
             source_project, source_repo, source_ref,
+            # Описание уже в деталях PR — метка @jarvis (spec 016) читается
+            # тем же кодом, что и на вебхуке. Новых запросов к Bitbucket нет.
+            (pr_details or {}).get("description"),
         )
     except Exception as e:
         # review_pull_request сам ловит внутренние сбои и постит user-safe коммент,
