@@ -360,12 +360,31 @@ def post_general_comment(project: str, repo: str, pr_id: int, text: str):
     post_comment(project, repo, pr_id, text)
 
 
+# Блок затрат токенов — единственная НЕСТАБИЛЬНАЯ часть итоговых комментариев:
+# цифры меняются от прогона к прогону (кэш Феникса плавает, ретраи добавляют
+# запросы). Бот stateless и узнаёт «что уже прокомментировано», сравнивая тексты
+# со свисающими в PR, поэтому нестабильный текст = новый ключ = комментарий
+# постится заново на каждый pr:modified. Вырезаем блок из ключа — и из нового
+# текста, и из старых, прочитанных из Bitbucket: обе стороны сравнения проходят
+# через _comment_key, так что рассинхрон невозможен по построению.
+_COSTS_BLOCK_RE = re.compile(
+    r"\U0001f4b0\s*\*\*Затраты токенов Феникса\*\*.*?Запросов к Фениксу:\s*\d+",
+    re.DOTALL,
+)
+
+
+def _strip_cost_block(text: str) -> str:
+    """Убирает блок затрат токенов — он не должен влиять на дедупликацию."""
+    return _COSTS_BLOCK_RE.sub("", text or "")
+
+
 def _comment_key(path: Optional[str], line: Optional[int], text: str) -> tuple:
     """Ключ для дедупликации комментария.
     Текст нормализуем (схлопываем пробелы + lower), чтобы мелкие различия
-    форматирования не считались новым комментарием.
+    форматирования не считались новым комментарием. Блок затрат токенов
+    вырезаем: его цифры меняются каждый прогон и сделали бы ключ одноразовым.
     """
-    norm = " ".join((text or "").split()).lower()
+    norm = " ".join(_strip_cost_block(text).split()).lower()
     # line из ответа LLM может быть кривым ("unknown", "42-45", None) —
     # не валим ревью, недопреобразуемое считаем за 0.
     try:
@@ -1347,16 +1366,23 @@ def _do_review(
         log.info("Нет добавленных строк/находок — пропускаю молча")
         return
 
+    # Состояние «что уже прокомментировано» берём из самого PR (бот stateless).
+    # Это и есть защита от дублей на pr:modified — уже висящее игнорируем.
+    existing = get_existing_comment_keys(project, repo, pr_id)
+
     # Ни Феникс не проверил, ни Inspector ничего не нашёл — старое поведение «мозг не ответил».
     if not all_comments and reviewed == 0 and fenix_failed:
-        post_general_comment(
-            project, repo, pr_id,
+        brain_down = (
             "🤖 **JARVIS Review**: Упс! Мой мозг (Феникс) не ответил. "
             "Проверка не удалась, попробуйте обновить PR позже. 🔌_error\n\n"
             f"{token_block}"
             "_Это автоматическое ревью. Обязательна проверка сеньором. "
             "ИИ пока не заменит кожаных! 🧠_"
         )
+        if _comment_key(None, None, brain_down) in existing:
+            log.info("⏭️ Комментарий «мозг не ответил» уже есть — пропускаю")
+        else:
+            post_general_comment(project, repo, pr_id, brain_down)
         return
 
     # Пометки о неполноте: Феникс по части файлов и/или perlcritic недоступен.
@@ -1383,10 +1409,6 @@ def _do_review(
             f"\n\nℹ️ Ещё {perlcritic_dropped} нарушений perlcritic не показаны "
             f"(лимит {PERLCRITIC_MAX_COMMENTS} на PR)."
         )
-
-    # Состояние «что уже прокомментировано» берём из самого PR (бот stateless).
-    # Это и есть защита от дублей на pr:modified — уже висящее игнорируем.
-    existing = get_existing_comment_keys(project, repo, pr_id)
 
     # 3. Нет замечаний
     if not all_comments:
