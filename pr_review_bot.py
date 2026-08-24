@@ -902,6 +902,24 @@ def ask_fenix(
         FENIX_SEMAPHORE.release()
 
 
+def _accumulate_usage(stats: dict, usage: dict) -> None:
+    """Прибавляет факты одного запроса к Фениксу к счётчику за весь PR.
+
+    Вызывается ПОСЛЕ КАЖДОГО обращения, а не один раз в конце: при адаптивном
+    откате «полный файл → ханки» запросов на файл два, и первый тоже списывается
+    с квоты. Если считать только последний, отчёт занизит расход ровно на самых
+    дорогих случаях — тех, где полный файл не влез.
+
+    Отсутствующие поля (шлюз не прислал usage) считаем за 0: неполный отчёт о
+    стоимости лучше, чем упавшее из-за него ревью.
+    """
+    if not usage:
+        return
+    for key in ("prompt_tokens", "cached_tokens", "completion_tokens", "total_tokens"):
+        stats[key] += usage.get(key) or 0
+    stats["fenix_calls"] += 1
+
+
 # ── Основная логика ревью ───────────────────────────────────
 
 def review_pull_request(
@@ -1123,6 +1141,15 @@ def _do_review(
     inspector_incomplete = False    # mcp-drospr не ответил хотя бы на одном файле
     impact_incomplete = False       # граф вызовов недоступен (индекс не загружен/нет связи)
     llm_filtered_total = 0          # замечания Феникса вне изменённых строк (spec 011)
+    # Счётчик токенов Феникса за весь PR — для аллокации затрат. Публикуется
+    # отдельным блоком в итоговом комментарии (см. token_block ниже).
+    pr_token_stats = {
+        "prompt_tokens": 0,
+        "cached_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "fenix_calls": 0,
+    }
     dry_run_record(pr_id, {
         "type": "run",
         "project": project, "repo": repo, "pr_id": pr_id,
@@ -1206,7 +1233,7 @@ def _do_review(
                 log.info(f"🔗 {path}: импакт-фактов {len(impact_facts)}")
 
         usage: dict = {}
-        fenix_calls = 1
+        file_fenix_calls = 1
         result = ask_fenix(
             review_text, styleguide, perlcritic_facts, impact_facts,
             full_file=(context_mode == "file"),
@@ -1214,6 +1241,7 @@ def _do_review(
             truncate_lines=0 if context_mode == "file" else None,
             usage_out=usage,
         )
+        _accumulate_usage(pr_token_stats, usage)
         if result is None and context_mode == "file":
             # Адаптивный откат вместо угаданной константы: настоящий потолок входа
             # у шлюза Феникса нам неизвестен, поэтому пусть решает реальность.
@@ -1222,10 +1250,11 @@ def _do_review(
             fallback_reason = "Феникс не ответил на полный файл"
             context_mode = "hunks"
             usage = {}
-            fenix_calls = 2
+            file_fenix_calls = 2
             result = ask_fenix(
                 f["text"], styleguide, perlcritic_facts, impact_facts, usage_out=usage,
             )
+            _accumulate_usage(pr_token_stats, usage)
 
         llm_filtered_file = 0
         if result is None:
@@ -1280,7 +1309,7 @@ def _do_review(
             # Пересчитываем: если сработал адаптивный откат, файл поехал ханками уже
             # после первой попытки, и обрезка стала возможной.
             "hunk_truncated": context_mode == "hunks" and n_lines > MAX_DIFF_LINES,
-            "fenix_calls": fenix_calls,
+            "fenix_calls": file_fenix_calls,
             "llm_comments": len(result) if result else 0,
             "llm_filtered": llm_filtered_file,
             "usage": usage,
@@ -1299,6 +1328,19 @@ def _do_review(
         kept.append(c)
     all_comments = kept
 
+    # Блок затрат: цифры для аллокации бюджета Феникса. Показываем только когда
+    # запросы реально были — на PR, разобранном одним Inspector'ом, нули не нужны.
+    token_block = ""
+    if pr_token_stats["fenix_calls"] > 0:
+        token_block = (
+            f"💰 **Затраты токенов Феникса**\n"
+            f"- Вход (prompt): {pr_token_stats['prompt_tokens']}\n"
+            f"- Из них из кэша: {pr_token_stats['cached_tokens']}\n"
+            f"- Выход (completion): {pr_token_stats['completion_tokens']}\n"
+            f"- Итого: {pr_token_stats['total_tokens']}\n"
+            f"- Запросов к Фениксу: {pr_token_stats['fenix_calls']}\n\n"
+        )
+
     # Нечего ревьюить: ни добавленных строк, ни находок Inspector'а.
     # По конституции (Сценарий 4 «Пустой diff») — пропускаем молча.
     if not all_comments and reviewed == 0 and not fenix_failed:
@@ -1311,6 +1353,7 @@ def _do_review(
             project, repo, pr_id,
             "🤖 **JARVIS Review**: Упс! Мой мозг (Феникс) не ответил. "
             "Проверка не удалась, попробуйте обновить PR позже. 🔌_error\n\n"
+            f"{token_block}"
             "_Это автоматическое ревью. Обязательна проверка сеньором. "
             "ИИ пока не заменит кожаных! 🧠_"
         )
@@ -1350,6 +1393,7 @@ def _do_review(
         no_issues = (
             "🤖 **JARVIS Review**: Проверка завершена — замечаний нет! 🎉\n\n"
             "✅ Код чистый, придраться не к чему. Отличная работа! 👏\n\n"
+            f"{token_block}"
             "_Это автоматическое ревью, финальное слово за сеньором "
             "(ИИ пока не заменит кожаных 🧠)._"
             + failed_note
@@ -1421,6 +1465,7 @@ def _do_review(
         f"💡 Подсказок: {tips}\n\n"
         f"Источники: `[perlcritic]` {by_perlcritic} · "
         f"`[codestyle]` {by_codestyle} · `[JARVIS]` {by_jarvis}\n\n"
+        f"{token_block}"
         f"_Это автоматическое ревью. Обязательна проверка сеньором._"
         + failed_note
     )
