@@ -117,11 +117,13 @@ WIP_MARKERS = [
 WIP_NOTIFY_ENABLED = os.getenv("WIP_NOTIFY_ENABLED", "1") == "1"
 
 # ── Контекст ревью: ханки или полный файл (spec 011) ──────────
-# hunks (дефолт) — как раньше: в промпт уходят только куски diff'а.
-# file            — в промпт уходит ПОЛНЫЙ текст файла с пометкой изменённых строк:
+# hunks           — в промпт уходят только куски diff'а.
+# file (дефолт)   — в промпт уходит ПОЛНЫЙ текст файла с пометкой изменённых строк:
 #                   модель видит объявления, прагмы и валидацию выше по коду.
-# Дефолт сохраняет прод-поведение: режим включается явно, на время эксперимента.
-REVIEW_CONTEXT_MODE = os.getenv("REVIEW_CONTEXT_MODE", "hunks").strip().lower()
+# Дефолт сменён на file по итогам эксперимента 011: режим отработал на боевых PR
+# и раскатан в банке. hunks остаётся как откат одной переменной, без правки кода —
+# на случай, если файлы упрутся в бюджет токенов (см. REVIEW_FILE_MAX_CHARS).
+REVIEW_CONTEXT_MODE = os.getenv("REVIEW_CONTEXT_MODE", "file").strip().lower()
 if REVIEW_CONTEXT_MODE not in ("hunks", "file"):
     log.warning(
         f"⚠️ REVIEW_CONTEXT_MODE={REVIEW_CONTEXT_MODE!r} не распознан "

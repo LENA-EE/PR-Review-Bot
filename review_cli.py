@@ -32,7 +32,7 @@ IMPACT_ENABLED и т.д.). Токены в аргументах командно
   BITBUCKET_PROJECT=MYPROJ BITBUCKET_REPO=my-repo python3 review_cli.py --pr-id 42
 
   # Прогон эксперимента (spec 011): в PR ничего не пишется, результат — в файл.
-  # Режим A (как в проде):
+  # Режим A (только куски diff'а):
   python3 review_cli.py --pr-id 42 --dry-run --out-dir ~/jarvis_experiment/A_hunks \
       --context-mode hunks
   # Режим B (полный файл как контекст):
@@ -138,9 +138,9 @@ def parse_args(argv: "list[str] | None" = None) -> argparse.Namespace:
         "--context-mode",
         choices=("hunks", "file"),
         help=(
-            "Что показывать модели: hunks — только куски diff'а (как в проде), "
-            "file — полный текст файла с пометкой изменённых строк. "
-            "По умолчанию — ENV REVIEW_CONTEXT_MODE (иначе hunks)."
+            "Что показывать модели: hunks — только куски diff'а, "
+            "file — полный текст файла с пометкой изменённых строк (дефолт). "
+            "Без флага берётся ENV REVIEW_CONTEXT_MODE, а без неё — file."
         ),
     )
 
