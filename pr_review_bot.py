@@ -193,6 +193,11 @@ DRY_RUN_DIR = os.getenv("JARVIS_DRY_RUN_DIR", "").strip()
 # DRY_RUN_DIR уже после импорта модуля (папка приходит из --out-dir), поэтому на
 # уровне модуля её ещё нет.
 _DRY_RUN_FILE = None
+# Блокировка на первое вычисление пути: в webhook-режиме ревью идёт в
+# BackgroundTasks, и при FENIX_MAX_CONCURRENCY > 1 два потока могут войти сюда
+# одновременно. Без неё оба вычислят свою метку времени и записи одного прогона
+# разъедутся по двум файлам — нарушение «один прогон = один файл».
+_DRY_RUN_FILE_LOCK = threading.Lock()
 # ────────────────────────────────────────────────────────────
 
 
@@ -263,10 +268,11 @@ def _dry_run_path() -> str:
     разводит два прогона, стартовавших в одну секунду, — в один файл они не пишут.
     """
     global _DRY_RUN_FILE
-    if _DRY_RUN_FILE is None:
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        _DRY_RUN_FILE = os.path.join(DRY_RUN_DIR, f"run_{stamp}_{os.getpid()}.jsonl")
-    return _DRY_RUN_FILE
+    with _DRY_RUN_FILE_LOCK:
+        if _DRY_RUN_FILE is None:
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            _DRY_RUN_FILE = os.path.join(DRY_RUN_DIR, f"run_{stamp}_{os.getpid()}.jsonl")
+        return _DRY_RUN_FILE
 
 
 def dry_run_record(pr_id: int, record: dict) -> None:

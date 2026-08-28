@@ -7,7 +7,9 @@
 """
 
 import asyncio
+import datetime
 import json
+import threading
 import os
 import shutil
 import tempfile
@@ -66,6 +68,44 @@ class DryRunPathTest(unittest.TestCase):
 
     def test_путь_стабилен_в_рамках_процесса(self):
         self.assertEqual(bot._dry_run_path(), bot._dry_run_path())
+
+    def test_путь_один_при_конкурентном_первом_вызове(self):
+        """Гонка: в webhook-режиме ревью идёт в нескольких потоках.
+
+        Без блокировки два потока вычисляют разные метки времени, и записи
+        одного прогона разъезжаются по двум файлам.
+        """
+        # Настоящие метки времени в пределах одной секунды совпали бы и без
+        # блокировки — тест был бы ложно-зелёным. Подменяем часы так, чтобы
+        # каждое обращение давало новое значение: тогда второе вычисление
+        # обязано быть видимым.
+        calls = []
+
+        class _CountingClock:
+            @staticmethod
+            def now():
+                calls.append(1)
+                return datetime.datetime(2026, 1, 1, 0, 0, len(calls))
+
+        self.addCleanup(setattr, bot, "datetime", bot.datetime)
+        bot.datetime = _CountingClock
+
+        results = []
+        barrier = threading.Barrier(8)
+
+        def worker():
+            barrier.wait()          # стартуем максимально одновременно
+            results.append(bot._dry_run_path())
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(len(set(results)), 1, set(results))
+        # Путь вычислен ровно один раз на весь прогон.
+        self.assertEqual(len(calls), 1)
 
     def test_имя_содержит_время_и_pid(self):
         name = os.path.basename(bot._dry_run_path())
