@@ -131,7 +131,8 @@ def parse_args(argv: "list[str] | None" = None) -> argparse.Namespace:
         "--out-dir",
         help=(
             "Папка для отчётов dry-run (АБСОЛЮТНЫЙ путь ВНЕ клона репозитория). "
-            "Файл на каждый PR: pr_<id>.jsonl. По умолчанию — ENV JARVIS_DRY_RUN_DIR."
+            "Один файл на прогон: run_<дата>_<время>_<номер процесса>.jsonl. "
+            "По умолчанию — ENV JARVIS_DRY_RUN_DIR."
         ),
     )
     parser.add_argument(
