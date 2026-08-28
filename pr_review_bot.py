@@ -19,6 +19,8 @@ import time
 import threading
 import requests
 import logging
+from datetime import datetime
+from urllib.parse import urlparse
 from fastapi import FastAPI, Request, BackgroundTasks
 from typing import Optional
 
@@ -187,18 +189,52 @@ DRY_RUN     = os.getenv("JARVIS_DRY_RUN", "0") == "1"
 # директорию, а она на сервере — клон банковского репозитория, откуда содержимое
 # может уехать в git. Нет папки → dry-run не стартует (см. check_config / CLI).
 DRY_RUN_DIR = os.getenv("JARVIS_DRY_RUN_DIR", "").strip()
+# Путь файла отчёта считается ЛЕНИВО и кэшируется: review_cli.py присваивает
+# DRY_RUN_DIR уже после импорта модуля (папка приходит из --out-dir), поэтому на
+# уровне модуля её ещё нет.
+_DRY_RUN_FILE = None
 # ────────────────────────────────────────────────────────────
 
 
 # ── Проверка конфига при старте ─────────────────────────────
+
+def _check_url(name: str, value: str, required: bool = True) -> Optional[str]:
+    """Проверяет URL из ENV. Возвращает текст ошибки или None, если всё в порядке.
+
+    Схема только http/https и непустой хост. `http` разрешён сознательно:
+    mcp-drospr — внутренний сервис на uvicorn без TLS.
+
+    Смысл двойной: значение приходит извне процесса и не должно уходить в
+    requests непроверенным, а опечатка в .env иначе всплывает не при старте, а
+    в первом же запросе — то есть в середине ревью живого PR.
+    """
+    if not value:
+        return f"{name} не задан" if required else None
+    parsed = urlparse(value)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return f"{name}: ожидается http(s)://<хост>, получено {value!r}"
+    return None
+
+
 def check_config():
-    missing = []
+    # Список проблем конфига: и отсутствующие токены, и некорректные URL.
+    problems = []
     if not BITBUCKET_TOKEN:
-        missing.append("BITBUCKET_TOKEN")
+        problems.append("BITBUCKET_TOKEN не задан")
     if not FENIX_TOKEN:
-        missing.append("FENIX_TOKEN")
-    if missing:
-        log.error(f"❌ Не заданы переменные окружения: {', '.join(missing)}")
+        problems.append("FENIX_TOKEN не задан")
+    # URL-адреса проверяем тем же механизмом, что и токены: один список проблем
+    # конфига — одно сообщение при старте.
+    for problem in (
+        _check_url("BITBUCKET_URL", BITBUCKET_URL),
+        _check_url("FENIX_URL", FENIX_URL),
+        # Пустой MCP_DROSPR_URL = слой выключен, это штатная деградация.
+        _check_url("MCP_DROSPR_URL", MCP_DROSPR_URL, required=False),
+    ):
+        if problem:
+            problems.append(problem)
+    if problems:
+        log.error(f"❌ Проблемы конфигурации: {'; '.join(problems)}")
         log.error("Создай .env файл на сервере и перезапусти контейнер")
     else:
         log.info("✅ Конфиг загружен, все токены на месте")
@@ -219,10 +255,24 @@ def check_config():
 
 # ── Отчёт dry-run ───────────────────────────────────────────
 
+def _dry_run_path() -> str:
+    """Путь файла отчёта текущего прогона. Считается один раз за процесс.
+
+    Имя собирается из метки времени и PID, а НЕ из данных запроса: в пути не
+    должно быть ничего, что пришло из webhook, CLI или ответа Bitbucket. PID
+    разводит два прогона, стартовавших в одну секунду, — в один файл они не пишут.
+    """
+    global _DRY_RUN_FILE
+    if _DRY_RUN_FILE is None:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        _DRY_RUN_FILE = os.path.join(DRY_RUN_DIR, f"run_{stamp}_{os.getpid()}.jsonl")
+    return _DRY_RUN_FILE
+
+
 def dry_run_record(pr_id: int, record: dict) -> None:
     """Дописывает одну запись в JSONL-отчёт прогона. Вне dry-run — ничего не делает.
 
-    Формат: одна строка = один JSON-объект с полем `type`
+    Формат: одна строка = один JSON-объект с полями `type` и `pr_id`
     (`run` — старт прогона, `file` — как ревьюился файл, `comment` — что было бы
     опубликовано, `filtered` — что отсеял фильтр изменённых строк).
 
@@ -234,9 +284,13 @@ def dry_run_record(pr_id: int, record: dict) -> None:
     """
     if not DRY_RUN or not DRY_RUN_DIR:
         return
+    # Номер PR — поле записи, а не часть имени файла. Проставляем здесь, а не в
+    # четырёх местах вызова: новое место не сможет его забыть. setdefault —
+    # запись `run` уже несёт pr_id, перетирать её не нужно.
+    record.setdefault("pr_id", pr_id)
     try:
         os.makedirs(DRY_RUN_DIR, exist_ok=True)
-        path = os.path.join(DRY_RUN_DIR, f"pr_{pr_id}.jsonl")
+        path = _dry_run_path()
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except OSError as e:
@@ -1717,7 +1771,14 @@ async def bitbucket_webhook(request: Request, background_tasks: BackgroundTasks)
         # со значением null, вернётся None, и следующий .get упадёт AttributeError —
         # ровно тот баг, что ронял разбор diff на удалённом файле. Поэтому везде `or {}`.
         pr        = payload.get("pullRequest") or {}
-        pr_id     = pr.get("id")
+        # Приводим к int: значение приходит из недоверенного тела webhook, а
+        # дальше идёт и в URL Bitbucket, и в имена артефактов. Нечисловое —
+        # такой же неполный payload, как отсутствующий ключ (ветка ниже).
+        try:
+            pr_id = int(pr.get("id"))
+        except (TypeError, ValueError):
+            log.error(f"Некорректный pr_id в webhook: {pr.get('id')!r}")
+            pr_id = None
         to_ref    = pr.get("toRef") or {}
         repo      = to_ref.get("repository") or {}
         repo_slug = repo.get("slug")
