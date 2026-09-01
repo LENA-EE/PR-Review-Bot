@@ -188,7 +188,12 @@ DRY_RUN     = os.getenv("JARVIS_DRY_RUN", "0") == "1"
 # Папка для отчётов. Дефолта СОЗНАТЕЛЬНО нет: без него отчёт лёг бы в текущую
 # директорию, а она на сервере — клон банковского репозитория, откуда содержимое
 # может уехать в git. Нет папки → dry-run не стартует (см. check_config / CLI).
-DRY_RUN_DIR = os.getenv("JARVIS_DRY_RUN_DIR", "").strip()
+# `~` раскрываем СРАЗУ при чтении: иначе валидация видит абсолютный путь
+# (expanduser внутри _check_dir_path), а os.makedirs получает литеральную тильду
+# и создаёт каталог `~` в текущей директории — то есть в клоне репозитория,
+# ровно там, откуда отчёт и уводили. Проверенное и используемое значение
+# обязаны совпадать. В CLI то же самое делает parse_args для --out-dir.
+DRY_RUN_DIR = os.path.expanduser(os.getenv("JARVIS_DRY_RUN_DIR", "").strip())
 # Путь файла отчёта считается ЛЕНИВО и кэшируется: review_cli.py присваивает
 # DRY_RUN_DIR уже после импорта модуля (папка приходит из --out-dir), поэтому на
 # уровне модуля её ещё нет.
@@ -221,7 +226,62 @@ def _check_url(name: str, value: str, required: bool = True) -> Optional[str]:
     return None
 
 
-def check_config():
+def _check_dir_path(name: str, value: str) -> Optional[str]:
+    """Проверяет каталог из ENV. Возвращает текст проблемы или None.
+
+    Требования: непустое значение, АБСОЛЮТНЫЙ путь, и если путь уже существует —
+    это каталог. Абсолютность обязательна не из-за traversal (значение задаёт тот,
+    кто разворачивает бота), а потому что относительный путь разрешается от
+    текущей директории, а она на сервере — клон банковского репозитория:
+    отчёт лёг бы под git. Раньше эта проверка жила только в review_cli.py, то
+    есть один из двух входов в систему её не имел.
+    """
+    if not value:
+        return f"{name} не задан"
+    expanded = os.path.expanduser(value)
+    if not os.path.isabs(expanded):
+        return (
+            f"{name}: ожидается АБСОЛЮТНЫЙ путь вне клона репозитория, "
+            f"получено {value!r}"
+        )
+    resolved = os.path.realpath(expanded)
+    if os.path.exists(resolved) and not os.path.isdir(resolved):
+        return f"{name}: путь существует, но это не каталог: {resolved!r}"
+    return None
+
+
+def _check_file_path(name: str, value: str) -> Optional[str]:
+    """Проверяет путь к читаемому файлу из ENV. Возвращает текст проблемы или None.
+
+    Относительный путь допустим сознательно: дефолт стайлгайда — `./styleguide.md`
+    рядом с ботом, так он работает и в контейнере, и при запуске скриптом.
+    Проверяем то, что реально ломается: путь ведёт в каталог, файла нет или он
+    не читается. Без этой проверки опечатка в `STYLEGUIDE_PATH` даёт не отказ, а
+    тихое ревью без стайлгайда — для ревьюера это хуже падения.
+    """
+    if not value:
+        return f"{name} не задан"
+    resolved = _resolve_path(value)
+    if os.path.isdir(resolved):
+        return f"{name}: ожидается файл, получен каталог: {resolved!r}"
+    if not os.path.isfile(resolved):
+        return f"{name}: файл не найден: {resolved!r}"
+    if not os.access(resolved, os.R_OK):
+        return f"{name}: файл существует, но не читается: {resolved!r}"
+    return None
+
+
+def _resolve_path(value: str) -> str:
+    """Приводит путь из ENV к каноническому виду: ~ и симлинки развёрнуты.
+
+    Одна точка нормализации на всех потребителей: путь, который мы проверили,
+    и путь, который мы открываем, обязаны совпадать — иначе проверка ничего
+    не гарантирует.
+    """
+    return os.path.realpath(os.path.expanduser(value))
+
+
+def check_config() -> list[str]:
     # Список проблем конфига: и отсутствующие токены, и некорректные URL.
     problems = []
     if not BITBUCKET_TOKEN:
@@ -238,6 +298,21 @@ def check_config():
     ):
         if problem:
             problems.append(problem)
+    # Стайлгайд — НЕ блокер: без него бот работает, это штатная деградация
+    # (см. load_styleguide). Но молчать нельзя: отсутствие правил меняет качество
+    # ревью, и узнать об этом надо при старте, а не по пустым комментариям.
+    styleguide_problem = _check_file_path("STYLEGUIDE_PATH", STYLEGUIDE_PATH)
+    if styleguide_problem:
+        log.warning(f"⚠️ {styleguide_problem} — ревью пойдёт без стайлгайда")
+    # Каталог dry-run проверяем ТОЛЬКО когда режим включён: вне dry-run значение
+    # не используется, и пустой JARVIS_DRY_RUN_DIR не должен блокировать штатный
+    # запуск. Проблема каталога — блокирующая, тем же механизмом, что и токены:
+    # относительный путь разрешился бы от текущей директории (клон банковского
+    # репозитория), и отчёт dry-run уехал бы под git.
+    if DRY_RUN:
+        dry_run_problem = _check_dir_path("JARVIS_DRY_RUN_DIR", DRY_RUN_DIR)
+        if dry_run_problem:
+            problems.append(dry_run_problem)
     if problems:
         log.error(f"❌ Проблемы конфигурации: {'; '.join(problems)}")
         log.error("Создай .env файл на сервере и перезапусти контейнер")
@@ -247,15 +322,13 @@ def check_config():
     # постит, и без этой строки такое состояние можно не заметить неделями.
     log.info(f"⚙️ Контекст ревью: {REVIEW_CONTEXT_MODE}")
     if DRY_RUN:
+        # Отдельного сообщения о проблеме каталога здесь НЕТ намеренно: она уже
+        # ушла в `problems` выше, чтобы не логировать одну и ту же беду дважды.
         log.warning(
             f"🧪 DRY-RUN ВКЛЮЧЁН: комментарии в PR НЕ публикуются, "
             f"отчёты пишутся в {DRY_RUN_DIR or '<папка не задана!>'}"
         )
-        if not DRY_RUN_DIR:
-            log.error(
-                "❌ JARVIS_DRY_RUN=1, но JARVIS_DRY_RUN_DIR не задан — "
-                "укажи АБСОЛЮТНЫЙ путь вне клона репозитория."
-            )
+    return problems
 
 
 # ── Отчёт dry-run ───────────────────────────────────────────
@@ -551,10 +624,18 @@ STYLEGUIDE_PATH = os.getenv("STYLEGUIDE_PATH", "./styleguide.md")
 
 def load_styleguide() -> str:
     try:
-        with open(STYLEGUIDE_PATH, "rb") as f:
+        # Открываем ровно тот путь, который проверяет _check_file_path: одна точка
+        # нормализации (~ и симлинки), иначе валидатор и загрузчик могли бы смотреть
+        # на разные файлы, и проверка ничего не гарантировала бы.
+        with open(_resolve_path(STYLEGUIDE_PATH), "rb") as f:
             raw = f.read()
-    except FileNotFoundError:
-        log.warning("⚠️ Стайлгайд не найден, работаю без него")
+    except OSError as e:
+        # Ловим ВСЕ ошибки файловой системы, а не только FileNotFoundError:
+        # путь из ENV может вести на каталог (IsADirectoryError, на Windows —
+        # PermissionError) или на файл без прав чтения. Работа без стайлгайда —
+        # штатная деградация; необработанное исключение здесь роняло бы каждое
+        # ревью, то есть опечатка в ENV превращалась бы в отказ сервиса.
+        log.warning(f"⚠️ Стайлгайд не прочитан ({type(e).__name__}: {e}), работаю без него")
         return ""
 
     # Стайлгайд часто готовят копипастом из Confluence/Windows, где файл может
@@ -1870,6 +1951,10 @@ async def health():
 
 @app.on_event("startup")
 async def startup():
+    # Список проблем сознательно не используется: в сервисном режиме плохой конфиг
+    # логируется, но процесс не роняет (spec 019, FR-006). Перевод старта в
+    # fail-fast меняет поведение прода и решается отдельно. Возврат нужен CLI,
+    # который на тех же проблемах завершается с кодом 1.
     check_config()
 
 

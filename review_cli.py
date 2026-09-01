@@ -292,9 +292,18 @@ def main(argv: "list[str] | None" = None) -> int:
         f", отчёты в {pr_review_bot.DRY_RUN_DIR}" if pr_review_bot.DRY_RUN else "",
     )
 
-    # Токены проверяем ДО сетевых запросов — быстрый и понятный отказ.
-    if not pr_review_bot.BITBUCKET_TOKEN:
-        log.error("Не задан BITBUCKET_TOKEN — ревью невозможно. Заведи секьюр-параметр в TeamCity.")
+    # Конфиг проверяем ДО сетевых запросов и ПОСЛЕ применения флагов режима: так
+    # валидируется ФАКТИЧЕСКИЙ конфиг прогона (dry-run/каталог/контекст уже учтены).
+    # Раньше CLI проверял вручную лишь BITBUCKET_TOKEN — URL уходили в requests
+    # непроверенными, и один и тот же конфиг давал разное доверие на двух входах.
+    config_problems = pr_review_bot.check_config()
+    if config_problems:
+        for problem in config_problems:
+            log.error("Проблема конфигурации: %s", problem)
+        # Подсказку про TeamCity сохраняем: отсутствие токена здесь — самый частый
+        # случай, и без неё непонятно, ГДЕ заводить секрет при запуске из TeamCity.
+        if not pr_review_bot.BITBUCKET_TOKEN:
+            log.error("Заведи BITBUCKET_TOKEN как секьюр-параметр в TeamCity.")
         return 1
 
     bitbucket_url = pr_review_bot.BITBUCKET_URL

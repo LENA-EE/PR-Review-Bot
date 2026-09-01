@@ -1,19 +1,23 @@
-"""Тесты валидации конфига и пути отчёта dry-run (spec 017).
+"""Тесты валидации конфига и пути отчёта dry-run (spec 017 + spec 019).
 
 Закрывают находки SAST: путь файла отчёта не должен собираться из входных
-данных, а URL из ENV не должны уходить в requests непроверенными.
+данных, а URL из ENV не должны уходить в requests непроверенными (017).
+Плюс паритет проверки конфига между сервисом и CLI и валидация файловых
+путей из ENV (019).
 
 Запуск из папки pr_review_bot:  python -m unittest test_config_validation
 """
 
 import asyncio
 import datetime
+import importlib
 import json
 import threading
 import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 import pr_review_bot as bot
 
@@ -204,6 +208,182 @@ class WebhookPrIdTest(unittest.TestCase):
         # Ревью действительно поставлено в очередь, причём с числовым id.
         self.assertEqual(len(self.background.tasks), 1)
         self.assertIn(42, self.background.tasks[0][1])
+
+
+class CheckDirPathTest(unittest.TestCase):
+    """FR-003: валидация каталога dry-run из ENV."""
+
+    def test_пустое_значение_проблема(self):
+        self.assertIsNotNone(bot._check_dir_path("D", ""))
+
+    def test_относительный_путь_проблема(self):
+        # Причина требования — не traversal, а разрешение от cwd (клон репозитория).
+        self.assertIsNotNone(bot._check_dir_path("D", "reports"))
+        self.assertIsNotNone(bot._check_dir_path("D", "./reports"))
+
+    def test_абсолютный_существующий_каталог_ок(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        self.assertIsNone(bot._check_dir_path("D", d))
+
+    def test_абсолютный_несуществующий_путь_ок(self):
+        # Каталог создаётся лениво при записи — отсутствие пути не блокер.
+        d = os.path.join(tempfile.mkdtemp(), "ещё_нет")
+        self.addCleanup(shutil.rmtree, os.path.dirname(d), True)
+        self.assertIsNone(bot._check_dir_path("D", d))
+
+    def test_путь_ведёт_на_файл_проблема(self):
+        fd, path = tempfile.mkstemp()
+        os.close(fd)
+        self.addCleanup(os.remove, path)
+        self.assertIsNotNone(bot._check_dir_path("D", path))
+
+    def test_тильда_принимается_валидатором(self):
+        # `~/reports` — абсолютный путь после раскрытия, блокировать его не за что.
+        self.assertIsNone(bot._check_dir_path("D", "~/reports"))
+
+    def test_тильда_раскрыта_в_самой_переменной(self):
+        """Регрессия: валидатор раскрывал `~`, а DRY_RUN_DIR оставался с тильдой.
+
+        Тогда os.makedirs создавал каталог с именем `~` в текущей директории —
+        в клоне репозитория, ровно там, откуда отчёт и уводили. Проверяем не
+        валидатор, а значение, которое реально уходит в файловые операции.
+        """
+        with mock.patch.dict(os.environ, {"JARVIS_DRY_RUN_DIR": "~/reports"}):
+            reloaded = importlib.reload(bot)
+        try:
+            self.assertNotIn("~", reloaded.DRY_RUN_DIR)
+            self.assertTrue(os.path.isabs(reloaded.DRY_RUN_DIR))
+        finally:
+            # Возвращаем модуль в состояние по умолчанию: остальные тесты
+            # работают с этим же импортом.
+            importlib.reload(bot)
+
+
+class CheckFilePathTest(unittest.TestCase):
+    """FR-004: валидация пути стайлгайда из ENV."""
+
+    def test_существующий_файл_ок(self):
+        fd, path = tempfile.mkstemp()
+        os.close(fd)
+        self.addCleanup(os.remove, path)
+        self.assertIsNone(bot._check_file_path("F", path))
+
+    def test_несуществующий_файл_проблема(self):
+        self.assertIsNotNone(
+            bot._check_file_path("F", os.path.join(tempfile.gettempdir(), "нет_такого.md"))
+        )
+
+    def test_каталог_вместо_файла_проблема(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        self.assertIsNotNone(bot._check_file_path("F", d))
+
+    def test_пустое_значение_проблема(self):
+        self.assertIsNotNone(bot._check_file_path("F", ""))
+
+
+class CheckConfigReturnTest(unittest.TestCase):
+    """FR-001, FR-003: check_config() возвращает список проблем."""
+
+    def setUp(self):
+        # check_config читает module-level globals — сохраняем и восстанавливаем.
+        self._saved = {
+            k: getattr(bot, k)
+            for k in ("BITBUCKET_TOKEN", "FENIX_TOKEN", "BITBUCKET_URL",
+                      "FENIX_URL", "MCP_DROSPR_URL", "DRY_RUN", "DRY_RUN_DIR")
+        }
+        # Заведомо валидный конфиг — дальше точечно портим одно поле.
+        bot.BITBUCKET_TOKEN = "t"
+        bot.FENIX_TOKEN = "t"
+        bot.BITBUCKET_URL = "http://host"
+        bot.FENIX_URL = "http://host"
+        bot.MCP_DROSPR_URL = ""
+        bot.DRY_RUN = False
+        bot.DRY_RUN_DIR = ""
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            setattr(bot, k, v)
+
+    def test_возвращает_список(self):
+        self.assertIsInstance(bot.check_config(), list)
+
+    def test_валидный_конфиг_пустой_список(self):
+        self.assertEqual(bot.check_config(), [])
+
+    def test_отсутствие_токена_проблема(self):
+        bot.BITBUCKET_TOKEN = ""
+        problems = bot.check_config()
+        self.assertTrue(any("BITBUCKET_TOKEN" in p for p in problems))
+
+    def test_битый_url_проблема(self):
+        bot.FENIX_URL = "не-url"
+        problems = bot.check_config()
+        self.assertTrue(any("FENIX_URL" in p for p in problems))
+
+    def test_dry_run_относительный_каталог_блокирует(self):
+        bot.DRY_RUN = True
+        bot.DRY_RUN_DIR = "reports"
+        problems = bot.check_config()
+        self.assertTrue(any("JARVIS_DRY_RUN_DIR" in p for p in problems))
+
+    def test_dry_run_абсолютный_каталог_не_блокирует(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        bot.DRY_RUN = True
+        bot.DRY_RUN_DIR = d
+        self.assertEqual(bot.check_config(), [])
+
+    def test_каталог_не_проверяется_вне_dry_run(self):
+        # DRY_RUN=False: пустой каталог не должен превращаться в проблему.
+        bot.DRY_RUN = False
+        bot.DRY_RUN_DIR = ""
+        self.assertEqual(bot.check_config(), [])
+
+
+class StyleguidePathParityTest(unittest.TestCase):
+    """FR-005: проверяемый и открываемый путь стайлгайда совпадают."""
+
+    def setUp(self):
+        self._saved = bot.STYLEGUIDE_PATH
+
+    def tearDown(self):
+        bot.STYLEGUIDE_PATH = self._saved
+
+    def test_валидатор_и_загрузчик_смотрят_на_один_файл(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, "styleguide.md")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("правило: use strict")
+        bot.STYLEGUIDE_PATH = path
+        # Путь прошёл валидацию...
+        self.assertIsNone(bot._check_file_path("STYLEGUIDE_PATH", bot.STYLEGUIDE_PATH))
+        # ...и ровно он же успешно открылся загрузчиком.
+        self.assertIn("use strict", bot.load_styleguide())
+
+    def test_каталог_вместо_файла_не_роняет_ревью(self):
+        """Критерий приёмки 019: каталог в STYLEGUIDE_PATH → предупреждение, не отказ.
+
+        FileNotFoundError каталог не покрывает (там IsADirectoryError, на Windows
+        PermissionError), поэтому раньше падало КАЖДОЕ ревью, а не только старт.
+        """
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        bot.STYLEGUIDE_PATH = d
+        self.assertIsNotNone(bot._check_file_path("STYLEGUIDE_PATH", d))
+        self.assertEqual(bot.load_styleguide(), "")
+
+    def test_несуществующий_файл_не_роняет_ревью(self):
+        bot.STYLEGUIDE_PATH = os.path.join(tempfile.gettempdir(), "нет_такого_файла.md")
+        self.assertEqual(bot.load_styleguide(), "")
+
+    def test_путь_с_тильдой_нормализуется_одинаково(self):
+        # _resolve_path раскрывает ~ и там, и там: проверенный путь = открытый путь.
+        resolved = bot._resolve_path("~/styleguide.md")
+        self.assertNotIn("~", resolved)
+        self.assertTrue(os.path.isabs(resolved))
 
 
 if __name__ == "__main__":
