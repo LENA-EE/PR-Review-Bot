@@ -155,6 +155,32 @@ REVIEW_FILE_MAX_CHARS = int(os.getenv("REVIEW_FILE_MAX_CHARS", "120000"))
 # пометка превращается в простыню и перестаёт читаться.
 COVERAGE_MAX_LISTED = int(os.getenv("COVERAGE_MAX_LISTED", "10"))
 
+# Тексты инлайн-пометок о неполном покрытии (spec 020 FR-002). Три РАЗНЫХ случая
+# намеренно сформулированы по-разному: в первых двух есть дыра в покрытии (модель
+# часть кода не видела, и её молчание по этому коду ничего не значит), в третьем
+# дыры нет (все изменённые строки просмотрены, но без окружения). Одинаковая
+# подача дезинформировала бы, поэтому различие вынесено прямо в текст, понятный
+# разработчику без знания внутренностей бота.
+COVERAGE_WARN_NOT_REVIEWED = (
+    "⚠️ **JARVIS: файл не проверен ИИ.**\n\n"
+    "Модель ревью (Феникс) не ответила по этому файлу — это сбой ИИ-сервиса, а не "
+    "проблема кода. Отсутствие замечаний здесь означает лишь, что файл никто не "
+    "смотрел. Обновите PR позже, чтобы бот попробовал снова."
+)
+COVERAGE_WARN_TRUNCATED = (
+    "✂️ **JARVIS: показана не вся правка этого файла.**\n\n"
+    "Изменения превысили лимит объёма, и хвост правки в модель не попал — часть "
+    "добавленных строк она не видела. Отсутствие замечаний по этой части ничего "
+    "не значит, просмотрите её глазами."
+)
+COVERAGE_WARN_HUNKS = (
+    "📄 **JARVIS: файл просмотрен по фрагментам, без окружающего кода.**\n\n"
+    "Все изменённые строки проверены, но модель видела только сами правки, без "
+    "остального файла: объявления и валидацию выше по коду она не учитывала. "
+    "Это не замечание к коду, а режим просмотра — перепроверьте связь правок с "
+    "окружением самостоятельно."
+)
+
 # ── Что публиковать: порог важности и метка автора (spec 016) ──
 # Базовый уровень для всего развёртывания. Автор PR может РАСШИРИТЬ его меткой
 # в описании; сузить ниже error нельзя — критичное видно всегда (FR-012).
@@ -554,6 +580,20 @@ def _comment_key(path: Optional[str], line: Optional[int], text: str) -> tuple:
     except (TypeError, ValueError):
         line_num = 0
     return (path or "", line_num, norm)
+
+
+def _coverage_key(path: Optional[str], text: str) -> tuple:
+    """Ключ дедупликации пометки о покрытии — БЕЗ номера строки.
+
+    Отличие от _comment_key принципиальное. Обычное замечание привязано к
+    конкретному фрагменту кода: сместился фрагмент — замечание относится уже к
+    другому месту, и номер в ключе уместен. Пометка о покрытии одна на файл, её
+    текст — константа модуля, а строка нужна лишь как место крепления. Когда
+    автор дописывает строки выше по файлу, якорь уезжает; с номером в ключе
+    старая пометка не опознавалась бы, и каждый push вешал бы новую копию.
+    """
+    norm = " ".join(_strip_cost_block(text).split()).lower()
+    return (path or "", norm)
 
 
 def get_existing_comment_keys(project: str, repo: str, pr_id: int) -> set:
@@ -1287,6 +1327,130 @@ def _resolve_review_context(
     return raw_code, diff_filter.render_file_with_diff_marks(raw_code, changed), "file", ""
 
 
+# Метка добавленной строки в f["text"] — тот же формат, что и в parse_bitbucket_diff
+# (`[L<n>] +`). Отдельный локальный шаблон, а не импорт из diff_filter: пометки о
+# покрытии обязаны работать даже когда Inspector-модули не загрузились (см. блок
+# try/except импорта), иначе честность отчёта зависела бы от наличия линтера.
+_COVERAGE_ANCHOR_RE = re.compile(r"^\[L(\d+)\] \+", re.MULTILINE)
+
+
+# Категории неполного покрытия. Именованные константы, а не строковые литералы:
+# опечатка в одном из мест иначе давала бы KeyError на живом PR, а так — NameError
+# при импорте модуля, то есть на стенде.
+COVERAGE_NOT_REVIEWED = "not_reviewed"
+COVERAGE_TRUNCATED = "truncated"
+COVERAGE_HUNKS = "hunks"
+
+
+def _coverage_anchor(diff_text: Optional[str]) -> Optional[int]:
+    """Номер первой ДОБАВЛЕННОЙ строки файла — якорь инлайн-пометки о покрытии.
+
+    Берём именно добавленную строку (`[L<n>] +`), а не любую с номером: пометка
+    должна встать на код, который PR реально тронул, иначе она прилипнет к чужой
+    контекстной строке. Нет добавленных строк → None: такой файл якорить некуда,
+    и вызывающий уводит его в сводку поимённо (FR-010).
+    """
+    if not diff_text:
+        return None
+    m = _COVERAGE_ANCHOR_RE.search(diff_text)
+    return int(m.group(1)) if m else None
+
+
+def _named_list(paths: list[str], limit: int) -> str:
+    """Перечень имён файлов с ограничением длины.
+
+    Имена нужны везде, где файл не получил инлайн-пометку: иначе он не назван
+    нигде, кроме лога контейнера, — та самая дыра, ради которой пометки и
+    заводились. Но и без потолка нельзя: PR из двух сотен файлов превратил бы
+    сводку в простыню. Потолок общий с лимитом пометок — одна крутилка на фичу.
+    """
+    shown = paths[:limit]
+    listed = ", ".join(shown)
+    hidden = len(paths) - len(shown)
+    return f"{listed} и ещё {hidden}" if hidden else listed
+
+
+def build_coverage_report(
+    fenix_failed: list[str],
+    truncated_files: list[tuple[str, int]],
+    hunks_fallback: list[str],
+    text_by_path: dict[str, str],
+    reviewed: int,
+    limit: int,
+) -> tuple[list[dict], str]:
+    """Раскладывает факты неполного покрытия на инлайн-пометки и сводную строку.
+
+    Возвращает (inline, summary):
+      inline  — по одной пометке на проблемный файл (не больше limit); каждая несёт
+                {file, line, text} с якорем на первой добавленной строке файла;
+      summary — строка счётчиков покрытия для сводного комментария (FR-003); пустая,
+                если неполных случаев нет вовсе.
+
+    Чистая функция без I/O: постинг, дедуп и dry-run — снаружи, здесь только
+    раскладка (одна ответственность, легко тестируется на фейковом diff).
+
+    Один файл даёт ОДНУ пометку по наиболее серьёзной причине: «не проверен»
+    важнее обрезки, обрезка важнее фрагментов. Причина в приоритете: дыра в
+    покрытии перекрывает сообщение о меньшем контексте, и один файл, попавший
+    сразу в две категории, не должен получить две противоречащие пометки.
+    """
+    # dict сохраняет порядок вставки → пометки идут предсказуемо: сначала
+    # непроверенные, потом обрезанные, потом ханки. setdefault держит приоритет.
+    category: dict[str, str] = {}
+    for path in fenix_failed:
+        category.setdefault(path, COVERAGE_NOT_REVIEWED)
+    for path, _lines in truncated_files:
+        category.setdefault(path, COVERAGE_TRUNCATED)
+    for path in hunks_fallback:
+        category.setdefault(path, COVERAGE_HUNKS)
+
+    texts = {
+        COVERAGE_NOT_REVIEWED: COVERAGE_WARN_NOT_REVIEWED,
+        COVERAGE_TRUNCATED: COVERAGE_WARN_TRUNCATED,
+        COVERAGE_HUNKS: COVERAGE_WARN_HUNKS,
+    }
+
+    inline: list[dict] = []
+    no_anchor: list[str] = []    # FR-010: якорь ставить некуда → в сводку поимённо
+    over_limit: list[str] = []   # FR-008: сверх лимита пометок → остаток в сводку
+    for path, cat in category.items():
+        anchor = _coverage_anchor(text_by_path.get(path))
+        if anchor is None:
+            no_anchor.append(path)
+            continue
+        if len(inline) >= limit:
+            over_limit.append(path)
+            continue
+        inline.append({"file": path, "line": anchor, "text": texts[cat]})
+
+    if not category:
+        return inline, ""
+
+    # Счётчики (FR-004): не проверено вовсе — только Феникс; частично — обрезка ЛИБО
+    # ханки; полностью — остальные отревьюенные файлы. Частичные ⊆ отревьюенных,
+    # поэтому полное считаем вычитанием, а не отдельным списком.
+    not_reviewed_count = sum(1 for c in category.values() if c == COVERAGE_NOT_REVIEWED)
+    partial_count = sum(1 for c in category.values() if c in (COVERAGE_TRUNCATED, COVERAGE_HUNKS))
+    full_count = max(reviewed - partial_count, 0)
+
+    summary = (
+        f"\n\n📊 **Покрытие ревью:** полностью просмотрено {full_count}, "
+        f"частично {partial_count}, не проверено вовсе {not_reviewed_count}. "
+        f"Файлы с неполным покрытием помечены отдельными комментариями в самих файлах."
+    )
+    if over_limit:
+        summary += (
+            f"\n\n_Не отмечены инлайн — превышен лимит пометок ({limit}): "
+            f"{_named_list(over_limit, limit)}._"
+        )
+    if no_anchor:
+        summary += (
+            f"\n\n_Без добавленных строк, пометку в файл поставить некуда: "
+            f"{_named_list(no_anchor, limit)}._"
+        )
+    return inline, summary
+
+
 def _do_review(
     project: str,
     repo: str,
@@ -1604,6 +1768,11 @@ def _do_review(
     existing = get_existing_comment_keys(project, repo, pr_id)
 
     # Ни Феникс не проверил, ни Inspector ничего не нашёл — старое поведение «мозг не ответил».
+    # Инлайн-пометки о покрытии (FR-001) здесь НЕ ставятся, и это сознательное
+    # исключение, а не забытая ветка: в этом сценарии не проверен НИ ОДИН файл,
+    # и пометки повторили бы одно и то же сообщение по каждому файлу PR. Общий
+    # комментарий ниже несёт ту же информацию и заметнее, чем N одинаковых
+    # пометок, разбросанных по файлам.
     if not all_comments and reviewed == 0 and fenix_failed:
         brain_down = (
             "🤖 **JARVIS Review**: Упс! Мой мозг (Феникс) не ответил. "
@@ -1618,15 +1787,49 @@ def _do_review(
             post_general_comment(project, repo, pr_id, brain_down)
         return
 
-    # Пометки о неполноте: Феникс по части файлов и/или perlcritic недоступен.
+    # Покрытие (spec 020): пометки о частично/вовсе не проверенных файлах уходят
+    # ИНЛАЙН в сами файлы (одна на файл, на первой добавленной строке), а в сводке
+    # остаётся строка счётчиков без перечня имён. Раскладку делает чистая функция,
+    # здесь — только постинг с дедупом. dry-run-guard внутри post_comment.
+    text_by_path = {f["path"]: f["text"] for f in files}
+    coverage_inline, coverage_summary = build_coverage_report(
+        fenix_failed, truncated_files, hunks_fallback,
+        text_by_path, reviewed, COVERAGE_MAX_LISTED,
+    )
+    # Дедуп пометок о покрытии идёт БЕЗ номера строки (см. _coverage_key): якорь
+    # смещается, когда автор дописывает строки выше по файлу, а текст пометки —
+    # константа. По ключу с номером такая пометка выглядела бы новой, и на каждый
+    # push бот вешал бы ещё одну копию.
+    existing_coverage = {(path, norm) for path, _line, norm in existing}
+    for warn in coverage_inline:
+        # FR-009: повторный pr:modified не плодит копий одной пометки.
+        key = _coverage_key(warn["file"], warn["text"])
+        if key in existing_coverage:
+            log.info(f"⏭️ Пометка о покрытии для {warn['file']} уже есть — пропускаю")
+            continue
+        try:
+            post_comment(
+                project, repo, pr_id,
+                text=warn["text"], file_path=warn["file"], line=warn["line"],
+            )
+            existing_coverage.add(key)
+        except Exception as e:
+            # Якорь есть, но Bitbucket его отверг — не теряем пометку, ставим общей.
+            # Если общая копия уже висит с прошлого прогона (Bitbucket отвергает
+            # якорь стабильно, например файл вне диффа), второй раз не постим.
+            general_key = _coverage_key(None, warn["text"])
+            if general_key in existing_coverage:
+                log.info(f"⏭️ Общая пометка о покрытии для {warn['file']} уже есть")
+                continue
+            log.warning(f"Пометку о покрытии ставлю общим комментарием ({warn['file']}): {e}")
+            try:
+                post_general_comment(project, repo, pr_id, warn["text"])
+                existing_coverage.add(general_key)
+            except Exception as e2:
+                log.error(f"Не удалось запостить пометку о покрытии: {e2}")
+
+    # Пометки о неполноте, НЕ относящиеся к покрытию по файлам (FR-006, не меняются).
     failed_note = ""
-    if fenix_failed:
-        failed_note += (
-            f"\n\n⚠️ Не удалось проверить файлы (Феникс не ответил): "
-            f"{', '.join(fenix_failed)}.\n"
-            f"_Это сбой на стороне ИИ-сервиса, а не проблема PR. "
-            f"Обнови PR позже для повторной проверки этих файлов._"
-        )
     if inspector_incomplete:
         failed_note += (
             "\n\n⚠️ Анализ perlcritic не выполнен (mcp-drospr недоступен) — "
@@ -1637,34 +1840,10 @@ def _do_review(
             "\n\nℹ️ Граф вызовов недоступен (индекс mcp-drospr не загружен) — "
             "импакт-анализ пропущен."
         )
-    # Две пометки намеренно РАЗНОЙ детальности.
-    # Обрезка — поимённо: это дыра в покрытии, разработчику нужно знать, какой
-    # именно файл дочитать глазами; без имени сообщение бесполезно. Таких файлов
-    # немного, а сверх COVERAGE_MAX_LISTED список сворачивается.
-    # Откат на ханки — счётчиком: все изменённые строки просмотрены, перечитывать
-    # руками нечего. Это сигнал «качество ниже обычного», а не список задач, и на
-    # PR из полутора десятков файлов поимённый перечень был бы чистым шумом.
-    # Имена при этом не теряются — они в логе, строкой «полный файл не применён».
-    if truncated_files:
-        shown = truncated_files[:COVERAGE_MAX_LISTED]
-        listed = ", ".join(
-            f"{path} ({lines} строк дифа при лимите {MAX_DIFF_LINES})"
-            for path, lines in shown
-        )
-        hidden = len(truncated_files) - len(shown)
-        if hidden:
-            listed += f" и ещё {hidden} файл(ов)"
-        failed_note += (
-            f"\n\n✂️ **Показана не вся правка:** {listed}.\n"
-            f"_Хвост дифа в промпт не попал — модель его не видела. Отсутствие замечаний по нему ничего не значит, просмотрите эту часть отдельно._"
-        )
-
-    if hunks_fallback:
-        failed_note += (
-            f"\n\n📄 По фрагментам, а не по полному файлу: {len(hunks_fallback)} шт. "
-            f"Все изменённые строки просмотрены, но без окружающего кода — "
-            f"объявления и валидацию выше по файлу модель не видела."
-        )
+    # Сводная строка покрытия (spec 020 FR-003): счётчики полностью/частично/не
+    # проверено, без перечня имён — имена теперь живут инлайн в самих файлах.
+    # Пустая, когда все файлы просмотрены полностью → строка не появляется.
+    failed_note += coverage_summary
 
     if perlcritic_dropped:
         failed_note += (
