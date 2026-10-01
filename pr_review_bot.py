@@ -72,6 +72,13 @@ FENIX_MODEL = os.getenv("FENIX_MODEL", "DeepSeek V3.2")
 # поэтому лимит теперь на файл, а не на склеенный diff всего PR (раньше хвост
 # multi-file PR молча выпадал). Защита бюджета Феникса.
 MAX_DIFF_LINES = int(os.getenv("MAX_DIFF_LINES", "400"))
+# Потолок того же входа в СИМВОЛАХ (spec 022): лимит в строках не ловит минифицированный
+# файл, где весь код — одна строка на мегабайты. 0 = без потолка. Режим «полный файл»
+# ограничен отдельно (REVIEW_FILE_MAX_CHARS) и этим потолком не затрагивается.
+DIFF_MAX_CHARS = int(os.getenv("DIFF_MAX_CHARS", "300000"))
+# Жёсткий лимит замечаний ИИ на файл (spec 022). Промпт просит «максимум 10», но
+# просьба — не гарантия. 0 = без лимита.
+LLM_MAX_COMMENTS_PER_FILE = int(os.getenv("LLM_MAX_COMMENTS_PER_FILE", "10"))
 
 # Лимит длины ответа модели. Дефолт 4096 — под вебхучный путь: там ревью идёт
 # фоном на каждый PR, и большой потолок зря бронирует бюджет Феникса (~500k
@@ -1019,6 +1026,7 @@ def ask_fenix(
     *,
     profile: str = profiles.PERL,
     file_ext: str = "",
+    truncated_out: Optional[dict] = None,
 ) -> Optional[list[dict]]:
     """Отправляет diff в Феникс, получает список замечаний.
     Возвращает None в случае ошибки, [] если замечаний нет.
@@ -1036,6 +1044,9 @@ def ask_fenix(
     profile (spec 022) — generic строит нейтральный промпт без стайлгайда и фактов
     линтеров; perl/perl-lite — Perl-промпт как раньше. file_ext — расширение файла
     для generic-промпта.
+    truncated_out — если передан словарь, при обрезке по DIFF_MAX_CHARS в него
+    кладётся by_chars=True. Отдельно от usage_out: непустой usage при сбое
+    Феникса исказил бы счётчик запросов.
     """
 
     # LiteLLM требует полного пути, даже если в ENV дано /v1
@@ -1050,6 +1061,14 @@ def ask_fenix(
         diff = "\n".join(diff_lines[:limit])
         diff += f"\n\n[... обрезано, первые {limit} строк ...]"
         log.warning(f"Diff обрезан до {limit} строк")
+    if not full_file and DIFF_MAX_CHARS > 0 and len(diff) > DIFF_MAX_CHARS:
+        before = len(diff)
+        cut = diff.rfind("\n", 0, DIFF_MAX_CHARS)
+        # Нет перевода строки в пределах лимита — минифицированная строка: режем ровно.
+        diff = diff[:cut if cut > 0 else DIFF_MAX_CHARS] + "\n\n[... обрезано по лимиту объёма ...]"
+        log.warning(f"Diff обрезан по лимиту объёма: {before} → {len(diff)} симв.")
+        if truncated_out is not None:
+            truncated_out["by_chars"] = True
 
     if profile == profiles.GENERIC:
         prompt = build_generic_prompt(diff, file_ext, full_file)
@@ -1442,6 +1461,42 @@ def _named_list(paths: list[str], limit: int) -> str:
     return f"{listed} и ещё {hidden}" if hidden else listed
 
 
+_SEVERITY_RANK = {"error": 0, "warning": 1, "suggestion": 2}
+
+
+def _cap_llm_comments(comments: list[dict], limit: int) -> tuple[list[dict], list[dict]]:
+    """Оставляет не больше limit замечаний, самые важные первыми (spec 022).
+
+    Возвращает (оставленные, отброшенные). Сортировка устойчивая: внутри одного
+    уровня порядок модели сохраняется. limit <= 0 — без лимита.
+    """
+    if limit <= 0 or len(comments) <= limit:
+        return comments, []
+    ranked = sorted(
+        comments,
+        key=lambda c: _SEVERITY_RANK.get(str(c.get("severity", "")).strip().lower(), 3),
+    )
+    return ranked[:limit], ranked[limit:]
+
+
+def _profile_lines(profile_counts: dict[str, int], skipped_by_rule: list[str]) -> str:
+    """Строки сводки о профилях и пропусках (spec 022). Пусто, если сказать нечего."""
+    lines = []
+    shown = [
+        f"{name} {profile_counts[name]}"
+        for name in (profiles.PERL, profiles.PERL_LITE, profiles.GENERIC)
+        if profile_counts.get(name)
+    ]
+    if shown:
+        lines.append(f"🧭 Профили: {' · '.join(shown)}")
+    if skipped_by_rule:
+        lines.append(
+            f"⏭️ Пропущено по правилам ({len(skipped_by_rule)}): "
+            f"{_named_list(skipped_by_rule, COVERAGE_MAX_LISTED)}"
+        )
+    return "\n".join(lines)
+
+
 def build_coverage_report(
     fenix_failed: list[str],
     truncated_files: list[tuple[str, int]],
@@ -1591,6 +1646,11 @@ def _do_review(
     #     кода. Хуже по качеству, полное по охвату.
     truncated_files: list[tuple[str, int]] = []
     hunks_fallback: list[str] = []
+    # Профили (spec 022): сколько файлов какого профиля реально ушло в ревью и что
+    # пропущено по правилам — для строк сводки.
+    profile_counts: dict[str, int] = {}
+    skipped_by_rule: list[str] = []
+    llm_capped_total = 0            # замечания ИИ сверх LLM_MAX_COMMENTS_PER_FILE
     # Счётчик токенов Феникса за весь PR — для аллокации затрат. Публикуется
     # отдельным блоком в итоговом комментарии (см. token_block ниже).
     pr_token_stats = {
@@ -1622,6 +1682,10 @@ def _do_review(
         if profile == profiles.SKIP:
             log.info(f"🧭 {path}: профиль skip ({profile_reason})")
             dry_run_record(pr_id, {"type": "skipped", "path": path, "reason": profile_reason})
+            skipped_by_rule.append(
+                f"{path} (похоже на минифицированный)"
+                if profile_reason == profiles.REASON_MINIFIED else path
+            )
             continue
 
         # — Контекст ревью: ханки или полный файл (spec 011) —
@@ -1645,6 +1709,7 @@ def _do_review(
             profile, profile_reason, path, raw_code, f["text"], repo_cfg,
         )
         log.info(f"🧭 {path}: профиль {profile} ({profile_reason})")
+        profile_counts[profile] = profile_counts.get(profile, 0) + 1
         file_ext = profiles.file_ext(path)
         # Стайлгайд — Perl-овый: generic-файлу он не нужен и не передаётся.
         file_styleguide = "" if profile == profiles.GENERIC else styleguide
@@ -1703,6 +1768,7 @@ def _do_review(
                 log.info(f"🔗 {path}: импакт-фактов {len(impact_facts)}")
 
         usage: dict = {}
+        truncated: dict = {}
         file_fenix_calls = 1
         result = ask_fenix(
             review_text, file_styleguide, perlcritic_facts, impact_facts,
@@ -1710,7 +1776,7 @@ def _do_review(
             # 0 = не обрезать: полный файл не должен резаться лимитом ханков.
             truncate_lines=0 if context_mode == "file" else None,
             usage_out=usage,
-            profile=profile, file_ext=file_ext,
+            profile=profile, file_ext=file_ext, truncated_out=truncated,
         )
         _accumulate_usage(pr_token_stats, usage)
         if result is None and context_mode == "file":
@@ -1724,7 +1790,7 @@ def _do_review(
             file_fenix_calls = 2
             result = ask_fenix(
                 f["text"], file_styleguide, perlcritic_facts, impact_facts, usage_out=usage,
-                profile=profile, file_ext=file_ext,
+                profile=profile, file_ext=file_ext, truncated_out=truncated,
             )
             _accumulate_usage(pr_token_stats, usage)
 
@@ -1734,6 +1800,7 @@ def _do_review(
             fenix_failed.append(path)
         else:
             reviewed += 1
+            file_llm: list[dict] = []
             for c in result:
                 # Имя файла НЕ передаётся модели (один файл на запрос) → её "file" мусор.
                 # Путь известен достоверно. Нормализуем в единый формат с source=JARVIS.
@@ -1755,13 +1822,26 @@ def _do_review(
                         "reason": "строка не изменена в этом PR",
                     })
                     continue
-                all_comments.append({
+                file_llm.append({
                     "file": path,
                     "line": line_num,
                     "severity": c.get("severity", "suggestion"),
                     "source": "JARVIS",
                     "body": body,
                 })
+            # Жёсткий лимит на файл (spec 022): отброшенное в all_comments НЕ попадает,
+            # поэтому счётчики сводки и фильтр spec 016 считают находки ПОСЛЕ лимита.
+            kept_llm, capped_llm = _cap_llm_comments(file_llm, LLM_MAX_COMMENTS_PER_FILE)
+            all_comments.extend(kept_llm)
+            for c in capped_llm:
+                dry_run_record(pr_id, {
+                    "type": "filtered", "file": path, "line": c["line"],
+                    "severity": c["severity"], "text": c["body"],
+                    "reason": "лимит замечаний на файл",
+                })
+            if capped_llm:
+                llm_capped_total += len(capped_llm)
+                log.info(f"✂️ {path}: замечаний ИИ сверх лимита — {len(capped_llm)}")
             if llm_filtered_file:
                 log.info(
                     f"🚧 {path}: отфильтровано замечаний вне изменённых строк — "
@@ -1772,6 +1852,9 @@ def _do_review(
         # Режим здесь уже окончательный (с учётом адаптивного отката), поэтому
         # и обрезку, и откат фиксируем именно тут, а не в момент выбора режима.
         if context_mode == "hunks" and n_lines > MAX_DIFF_LINES:
+            truncated_files.append((path, n_lines))
+        # Обрезка по символам (spec 022) — та же дыра в покрытии, что и по строкам.
+        if truncated.get("by_chars") and path not in [p for p, _ in truncated_files]:
             truncated_files.append((path, n_lines))
         if fallback_reason:
             hunks_fallback.append(path)
@@ -1861,6 +1944,21 @@ def _do_review(
             f"- Итого: {pr_token_stats['total_tokens']}\n"
             f"- Запросов к Фениксу: {pr_token_stats['fenix_calls']}\n\n"
         )
+
+    profile_lines = _profile_lines(profile_counts, skipped_by_rule)
+
+    # Все изменённые файлы ушли в skip (spec 022): молчать нельзя — со стороны это
+    # неотличимо от сломанного бота. Один общий комментарий с перечнем, с дедупом.
+    if skipped_by_rule and not profile_counts and not all_comments:
+        all_skipped = (
+            f"🤖 **JARVIS Review**: ⏭️ Все изменённые файлы пропущены по правилам "
+            f"({len(skipped_by_rule)}): {_named_list(skipped_by_rule, COVERAGE_MAX_LISTED)}"
+        )
+        if _comment_key(None, None, all_skipped) in get_existing_comment_keys(project, repo, pr_id):
+            log.info("⏭️ Комментарий «все файлы пропущены» уже есть — пропускаю")
+        else:
+            post_general_comment(project, repo, pr_id, all_skipped)
+        return
 
     # Нечего ревьюить: ни добавленных строк, ни находок Inspector'а.
     # По конституции (Сценарий 4 «Пустой diff») — пропускаем молча.
@@ -1955,12 +2053,18 @@ def _do_review(
             f"\n\nℹ️ Ещё {perlcritic_dropped} нарушений perlcritic не показаны "
             f"(лимит {PERLCRITIC_MAX_COMMENTS} на PR)."
         )
+    if llm_capped_total:
+        failed_note += (
+            f"\n\n_Замечаний ИИ сверх лимита {LLM_MAX_COMMENTS_PER_FILE} на файл: "
+            f"не показано {llm_capped_total}._"
+        )
 
     # 3. Нет замечаний
     if not all_comments:
         no_issues = (
             "🤖 **JARVIS Review**: Проверка завершена — замечаний нет! 🎉\n\n"
-            "✅ Код чистый, придраться не к чему. Отличная работа! 👏\n\n"
+            + (f"{profile_lines}\n\n" if profile_lines else "")
+            +            "✅ Код чистый, придраться не к чему. Отличная работа! 👏\n\n"
             f"{filter_note}\n\n"
             f"{token_block}"
             "_Это автоматическое ревью, финальное слово за сеньором "
@@ -2029,7 +2133,8 @@ def _do_review(
     summary = (
         f"🤖 **JARVIS Review** — автоматическая проверка завершена\n\n"
         f"📂 Проверено файлов: {reviewed}/{len(files)}\n"
-        f"🔴 Ошибок: {errors} · "
+        + (f"{profile_lines}\n" if profile_lines else "")
+        + f"🔴 Ошибок: {errors} · "
         f"🟡 Предупреждений: {warnings} · "
         f"💡 Подсказок: {tips}\n\n"
         f"Источники: `[perlcritic]` {by_perlcritic} · "

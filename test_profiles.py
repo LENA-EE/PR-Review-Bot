@@ -93,8 +93,8 @@ class TestPreProfile(unittest.TestCase):
         self.assertEqual(_profile("lib/A.pm", cfg), PERL)
 
     def test_repo_key_case_insensitive(self):
-        cfg = {"repos": {"proj/BSK": {"perl_profile": "perl"}}}
-        self.assertEqual(_profile("lib/A.pm", cfg, repo="PROJ/bsk"), PERL)
+        cfg = {"repos": {"proj/MonoRepo": {"perl_profile": "perl"}}}
+        self.assertEqual(_profile("lib/A.pm", cfg, repo="PROJ/monorepo"), PERL)
 
     def test_unknown_repo_gets_defaults(self):
         cfg = {"repos": {"PROJ/other": {"perl_profile": "perl"}}}
@@ -235,6 +235,11 @@ class TestParseConfig(unittest.TestCase):
             with self.subTest(name=name):
                 with self.assertRaises(ConfigError):
                     parse_config(data)
+
+    def test_example_file_is_valid(self):
+        example = os.path.join(os.path.dirname(os.path.abspath(__file__)), "profiles.example.json")
+        with open(example, encoding="utf-8") as fh:
+            parse_config(json.load(fh))
 
     def test_perl_in_paths_allowed_with_perl_profile(self):
         cfg = parse_config({"repos": {"P/r": {"perl_profile": "perl",
