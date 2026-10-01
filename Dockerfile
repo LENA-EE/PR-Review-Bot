@@ -6,7 +6,7 @@ WORKDIR /app
 RUN pip install --no-cache-dir fastapi uvicorn requests
 
 # Код бота
-COPY pr_review_bot.py .
+COPY pr_review_bot.py profiles.py ./
 
 # Стайлгайд — необязательный файл
 # Положи styleguide.md на сервере рядом с docker-compose.yml
