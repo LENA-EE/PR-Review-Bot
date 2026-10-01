@@ -22,14 +22,14 @@ class _ReviewHarness(unittest.TestCase):
     """Запускает _do_review с замоканным окружением и собирает вызовы."""
 
     def run_review(self, files, config=None, resolve=None, fenix_results=None,
-                   fenix_return=None, existing=None, fenix_effect=None):
+                   fenix_return=None, existing=None, fenix_effect=None, context_mode="hunks"):
         cfg = profiles.parse_config(config or {})
         with ExitStack() as stack:
             p = lambda *a, **kw: stack.enter_context(mock.patch.object(*a, **kw))  # noqa: E731
             p(bot.profiles, "load", return_value=cfg)
             self.get_diff = p(bot, "get_pr_diff", return_value=files)
             p(bot, "load_styleguide", return_value="СТАЙЛГАЙД")
-            p(bot, "REVIEW_CONTEXT_MODE", "hunks")
+            p(bot, "REVIEW_CONTEXT_MODE", context_mode)
             p(bot, "PERLCRITIC_ENABLED", True)
             p(bot, "IMPACT_ENABLED", True)
             p(bot, "MCP_DROSPR_URL", "http://mcp.local")
@@ -74,8 +74,12 @@ class TestReviewLoopProfiles(_ReviewHarness):
         self.assertEqual(tsx["styleguide"], "")
 
     def test_skipped_file_is_not_downloaded(self):
-        self.run_review([LOCK, PM])
-        fetched = [c.args[5] for c in self.raw.call_args_list]
+        # Режим file: каждый НЕпропущенный файл качается — значит, проверка не вхолостую.
+        with mock.patch.object(bot, "REVIEW_CONTEXT_MODE", "file"):
+            self.run_review([LOCK, TSX], context_mode="file")
+        fetched = [c.kwargs.get("path", c.args[5] if len(c.args) > 5 else None)
+                   for c in self.raw.call_args_list]
+        self.assertIn(TSX["path"], fetched)
         self.assertNotIn(LOCK["path"], fetched)
 
     def test_perlcritic_only_for_perl(self):
@@ -171,6 +175,14 @@ class TestSummaryAndLimits(_ReviewHarness):
         self.assertEqual(len(inline), 10)
         self.assertEqual(sum("e0" in t or "e1" in t or "e2" in t for t in inline), 3)
         self.assertIn("Замечаний ИИ сверх лимита 10 на файл: не показано 5", self._general_texts()[-1])
+
+    def test_cap_applies_before_publication_filter(self):
+        # Лимит режет найденное, фильтр spec 016 решает, что из оставшегося публиковать.
+        remarks = [{"line": i, "severity": "suggestion", "comment": f"c{i}"} for i in range(1, 16)]
+        with mock.patch.object(bot, "POST_MIN_SEVERITY", "warning"):
+            self.run_review([_many_lines(15)], fenix_return=remarks)
+        self.inline.assert_not_called()
+        self.assertIn("не показано 5", self._general_texts()[-1])
 
     def test_char_truncation_marks_coverage(self):
         def fenix(*args, **kwargs):

@@ -29,7 +29,7 @@ SKIP = "skip"
 PROFILES = (PERL, PERL_LITE, GENERIC, SKIP)
 PERL_PROFILES = (PERL, PERL_LITE)
 
-PERL_EXTENSIONS = (".pl", ".pm", ".t")
+PERL_EXTENSIONS = (".pl", ".pm", ".t", ".psgi")
 
 REASON_DEFAULT = "по умолчанию"
 REASON_EXTENSION = "расширение"
@@ -86,30 +86,63 @@ def file_ext(path: str) -> str:
     return name[dot:].lower()
 
 
-def _glob_to_regex(pattern: str) -> str:
-    out: list[str] = []
-    i = 0
-    n = len(pattern)
-    while i < n:
-        if pattern.startswith("**/", i):
-            out.append("(?:.*/)?")
-            i += 3
-        elif pattern.startswith("/**", i) and i + 3 == n:
-            out.append("/.*")
-            i += 3
-        elif pattern.startswith("**", i):
-            out.append(".*")
-            i += 2
-        elif pattern[i] == "*":
-            out.append("[^/]*")
-            i += 1
-        elif pattern[i] == "?":
-            out.append("[^/]")
-            i += 1
+def _match_segment(pattern: str, text: str) -> bool:
+    """Сопоставление одного сегмента пути с `*` и `?` (оба не переходят `/`).
+
+    Жадный алгоритм с откатом только к последней `*`: время O(len(pattern) *
+    len(text)) в худшем случае, без экспоненциального перебора, который давал
+    regex на шаблонах вида `*a*a*a*b` (ReDoS: имя файла задаёт автор PR).
+    """
+    p = t = 0
+    star = -1
+    star_t = 0
+    while t < len(text):
+        if p < len(pattern) and (pattern[p] == "?" or pattern[p] == text[t]):
+            p += 1
+            t += 1
+        elif p < len(pattern) and pattern[p] == "*":
+            star = p
+            star_t = t
+            p += 1
+        elif star != -1:
+            p = star + 1
+            star_t += 1
+            t = star_t
         else:
-            out.append(re.escape(pattern[i]))
-            i += 1
-    return "".join(out)
+            return False
+    while p < len(pattern) and pattern[p] == "*":
+        p += 1
+    return p == len(pattern)
+
+
+def _match_segments(pat: tuple[str, ...], parts: tuple[str, ...]) -> bool:
+    """Сопоставление пути по сегментам; `**` — ноль или более каталогов.
+
+    Динамика по (сегмент шаблона, сегмент пути): O(len(pat) * len(parts))
+    вызовов `_match_segment`. Завершающий `**` требует хотя бы один сегмент:
+    `docs/**` — всё ВНУТРИ `docs/`, но не сам `docs`.
+    """
+    n, m = len(pat), len(parts)
+    # reach[j] — шаблон pat[:i] покрывает parts[:j]
+    reach = [True] + [False] * m
+    for i, seg in enumerate(pat):
+        nxt = [False] * (m + 1)
+        if seg == "**":
+            last = i == n - 1
+            seen = False
+            for j in range(m + 1):
+                if last:
+                    # хотя бы один сегмент после префикса
+                    nxt[j] = seen
+                    seen = seen or reach[j]
+                else:
+                    seen = seen or reach[j]
+                    nxt[j] = seen
+        else:
+            for j in range(1, m + 1):
+                nxt[j] = reach[j - 1] and _match_segment(seg, parts[j - 1])
+        reach = nxt
+    return reach[m]
 
 
 @dataclass(frozen=True)
@@ -117,10 +150,11 @@ class Glob:
     """Шаблон пути (FR-015).
 
     Без `/` — сравнивается с именем файла на любой глубине; с `/` — с полным
-    путём от корня репо. `**` — любые каталоги, `*` и `?` не переходят `/`.
+    путём от корня репо. `**` — любые каталоги (только целым сегментом:
+    `dir/**`, `**/x/**`, `a/**/b`), `*` и `?` не переходят `/`.
     """
     pattern: str
-    regex: "re.Pattern[str]" = field(compare=False)
+    segments: tuple[str, ...] = field(compare=False)
     basename_only: bool = field(compare=False)
 
     @classmethod
@@ -131,15 +165,18 @@ class Glob:
             raise ConfigError(f"шаблон длиннее {GLOB_MAX_LEN} символов: {pattern[:40]!r}…")
         if pattern.count("*") > GLOB_MAX_STARS:
             raise ConfigError(f"в шаблоне больше {GLOB_MAX_STARS} символов '*': {pattern!r}")
-        return cls(
-            pattern=pattern,
-            regex=re.compile(_glob_to_regex(pattern), re.DOTALL),
-            basename_only="/" not in pattern,
-        )
+        segments = tuple(pattern.split("/"))
+        for seg in segments:
+            if "**" in seg and seg != "**":
+                raise ConfigError(
+                    f"'**' допустим только целым сегментом (dir/**, **/x): {pattern!r}"
+                )
+        return cls(pattern=pattern, segments=segments, basename_only="/" not in pattern)
 
     def matches(self, path: str) -> bool:
-        target = path.rsplit("/", 1)[-1] if self.basename_only else path
-        return self.regex.fullmatch(target) is not None
+        if self.basename_only:
+            return _match_segment(self.pattern, path.rsplit("/", 1)[-1])
+        return _match_segments(self.segments, tuple(path.split("/")))
 
 
 _BUILTIN_FILE_GLOBS = tuple(Glob.compile(p) for p in BUILTIN_SKIP_FILES)
@@ -295,8 +332,10 @@ def _read(path: str) -> Optional[ProfilesConfig]:
 def load(path: Optional[str] = None) -> ProfilesConfig:
     """Загружает конфиг. Не бросает исключений: бот без конфига работает на умолчаниях.
 
-    Битый файл НЕ сбрасывает настройки на умолчания, если до этого была успешная
-    загрузка: опечатка не должна снимать `enabled: false` с выключенных репо.
+    Битый или пропавший файл НЕ сбрасывает настройки на умолчания, если до этого
+    была успешная загрузка: опечатка или момент замены файла (`mv`, `sed -i`) не
+    должны снимать `enabled: false` с выключенных репо. Удалить конфиг насовсем —
+    удалить файл и перезапустить бот.
     """
     global _last_good, _status
     target = path if path is not None else default_path()
@@ -308,18 +347,26 @@ def load(path: Optional[str] = None) -> ProfilesConfig:
             fallback = _last_good
         log.error(
             f"❌ profiles: {e} — "
-            + ("работаю на последнем исправном конфиге" if fallback else "профили по умолчанию")
+            + ("работаю на последнем исправном конфиге" if fallback else
+               "профили по умолчанию: enabled:false и perl_profile из файла НЕ действуют")
         )
         return fallback or DEFAULT_CONFIG
 
     with _lock:
         previous = _status
-        if config is None:
-            _status = STATUS_ABSENT
-            _last_good = None
-        else:
+        kept = _last_good if config is None else None
+        if config is not None:
             _status = STATUS_OK
             _last_good = config
+        elif kept is not None:
+            _status = STATUS_ERROR
+        else:
+            _status = STATUS_ABSENT
+    if kept is not None:
+        log.warning(
+            f"⚠️ profiles: файл пропал ({target}) — работаю на последнем исправном конфиге"
+        )
+        return kept
     # Конфиг читается на каждый вебхук и PR — пишем только смену состояния, не каждый раз.
     if config is None:
         if previous != STATUS_ABSENT:
@@ -388,11 +435,14 @@ def refine_by_shebang(
     profile: str, reason: str, path: str,
     raw_code: Optional[str], diff_text: str, repo_cfg: RepoConfig,
 ) -> tuple[str, str]:
-    """Уточняет generic-по-умолчанию для файла без расширения по shebang (FR-006).
+    """Уточняет generic-по-умолчанию по shebang `#!…perl` (FR-006).
 
-    Явные решения (правило папки, skip) не трогает.
+    Любой такой файл, с расширением или без (`.cgi`, скрипт без расширения):
+    раньше бот слал Perl-промпт всем файлам, и Perl-скрипты с нестандартным
+    расширением не должны молча переехать в generic. Явные решения (правило
+    папки, skip) не трогает.
     """
-    if profile != GENERIC or reason != REASON_DEFAULT or file_ext(path):
+    if profile != GENERIC or reason != REASON_DEFAULT:
         return profile, reason
     first = _first_line(raw_code, diff_text)
     if first is not None and first.startswith("#!") and "perl" in first:

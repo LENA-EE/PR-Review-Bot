@@ -75,6 +75,24 @@ class TestGlob(unittest.TestCase):
     def test_case_sensitive(self):
         self.assertFalse(Glob.compile("docs/**").matches("Docs/a.md"))
 
+    def test_double_star_only_as_whole_segment(self):
+        for bad in ("a**b", "docs/x**", "**.js"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ConfigError):
+                    Glob.compile(bad)
+
+    def test_no_catastrophic_backtracking(self):
+        # Раньше regex на таком шаблоне работал секунды на 40 символах и часы на 255.
+        import time
+        name = "a" * 255
+        for pattern in ("*a*a*a*a*a*a*a*b", "x/*a*a*a*a*a*a*b", "**/*a*a*a*a*a*b"):
+            with self.subTest(pattern=pattern):
+                glob = Glob.compile(pattern)
+                start = time.perf_counter()
+                self.assertFalse(glob.matches(name))
+                self.assertFalse(glob.matches("x/" + name))
+                self.assertLess(time.perf_counter() - start, 0.5)
+
     def test_limits(self):
         for bad in ("", 5, None, "a" * 201, "*" * 9):
             with self.subTest(bad=bad):
@@ -188,8 +206,13 @@ class TestShebang(unittest.TestCase):
     def test_first_line_unavailable(self):
         self.assertEqual(self._refine("bin/run_job", None, "[L5] +1;"), (GENERIC, "по умолчанию"))
 
-    def test_file_with_extension_not_refined(self):
-        self.assertEqual(self._refine("bin/x.sh", "#!/usr/bin/perl")[0], GENERIC)
+    def test_perl_shebang_with_other_extension(self):
+        # Раньше Perl-промпт получал любой файл: .cgi с perl-shebang не должен уехать в generic.
+        self.assertEqual(self._refine("cgi-bin/form.cgi", "#!/usr/bin/perl -T")[0], PERL_LITE)
+        self.assertEqual(self._refine("bin/x.sh", "#!/bin/sh")[0], GENERIC)
+
+    def test_psgi_is_perl_by_extension(self):
+        self.assertEqual(_profile("app.psgi"), PERL_LITE)
 
     def test_explicit_folder_rule_not_refined(self):
         cfg = {"repos": {"PROJ/repo": {"paths": [{"glob": "bin/**", "profile": "generic"}]}}}
@@ -300,6 +323,26 @@ class TestLoad(unittest.TestCase):
             cfg = profiles.load(self.path)
         self.assertFalse(cfg.repo("P/r").enabled)
         self.assertEqual(profiles.status(), "error")
+
+    def test_file_vanished_after_good_keeps_last_good(self):
+        # Момент замены файла (mv, sed -i) не должен снимать enabled:false.
+        self._write(json.dumps({"repos": {"P/r": {"enabled": False}}}))
+        profiles.load(self.path)
+        os.remove(self.path)
+        with self.assertLogs("jarvis-pr-review", "WARNING"):
+            cfg = profiles.load(self.path)
+        self.assertFalse(cfg.repo("P/r").enabled)
+        self.assertEqual(profiles.status(), "error")
+
+    def test_file_back_after_vanish_is_ok(self):
+        self._write(json.dumps({"repos": {"P/r": {"enabled": False}}}))
+        profiles.load(self.path)
+        os.remove(self.path)
+        profiles.load(self.path)
+        self._write(json.dumps({}))
+        cfg = profiles.load(self.path)
+        self.assertTrue(cfg.repo("P/r").enabled)
+        self.assertEqual(profiles.status(), "ok")
 
     def test_duplicate_json_keys_are_error(self):
         self._write('{"repos": {"P/r": {"enabled": false}, "P/r": {}}}')
