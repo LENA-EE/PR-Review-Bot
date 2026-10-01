@@ -313,15 +313,20 @@ def load(path: Optional[str] = None) -> ProfilesConfig:
         return fallback or DEFAULT_CONFIG
 
     with _lock:
+        previous = _status
         if config is None:
             _status = STATUS_ABSENT
             _last_good = None
         else:
             _status = STATUS_OK
             _last_good = config
+    # Конфиг читается на каждый вебхук и PR — пишем только смену состояния, не каждый раз.
     if config is None:
-        log.info(f"ℹ️ PROFILES_PATH: файл не найден ({target}) — профили по умолчанию")
+        if previous != STATUS_ABSENT:
+            log.info(f"ℹ️ PROFILES_PATH: файл не найден ({target}) — профили по умолчанию")
         return DEFAULT_CONFIG
+    if previous != STATUS_OK:
+        log.info(f"✅ profiles: конфиг загружен ({target})")
     return config
 
 

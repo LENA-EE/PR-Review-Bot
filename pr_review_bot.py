@@ -352,6 +352,9 @@ def check_config() -> list[str]:
     # Режимы печатаем ВСЕГДА: включённый dry-run на проде = бот молча ничего не
     # постит, и без этой строки такое состояние можно не заметить неделями.
     log.info(f"⚙️ Контекст ревью: {REVIEW_CONTEXT_MODE}")
+    # Конфиг профилей необязателен: проблема с ним — предупреждение, не блокер.
+    profiles.load()
+    log.info(f"⚙️ Профили стеков: {profiles.status()} ({profiles.default_path()})")
     if DRY_RUN:
         # Отдельного сообщения о проблеме каталога здесь НЕТ намеренно: она уже
         # ушла в `problems` выше, чтобы не логировать одну и ту же беду дважды.
@@ -384,7 +387,8 @@ def dry_run_record(pr_id: int, record: dict) -> None:
 
     Формат: одна строка = один JSON-объект с полями `type` и `pr_id`
     (`run` — старт прогона, `file` — как ревьюился файл, `comment` — что было бы
-    опубликовано, `filtered` — что отсеял фильтр изменённых строк).
+    опубликовано, `filtered` — что отсеял фильтр изменённых строк, `skipped` —
+    файл не ревьюился по профилю skip, spec 022).
 
     В отчёт НЕ пишутся ни промпт, ни содержимое файлов — только замечания и
     метаданные: отчёт переживает эксперимент и может быть скопирован, поэтому
@@ -1256,11 +1260,6 @@ def review_pull_request(
             pass
 
 
-def _perl_file(path: str) -> bool:
-    """perlcritic применим только к Perl-файлам."""
-    return path.lower().endswith((".pl", ".pm", ".t"))
-
-
 def _inspect_file(
     f: dict,
     source_project: Optional[str],
@@ -1268,8 +1267,12 @@ def _inspect_file(
     source_ref: Optional[str],
     sg_rules: list,
     file_content: Optional[str] = None,
+    *,
+    profile: str,
 ) -> tuple[list[dict], list[str], bool]:
     """Детерминированный Inspector одного файла: perlcritic (mcp-drospr) + styleguide-grep.
+
+    Оба слоя — только для Perl-профилей (spec 022): generic и skip их не получают.
 
     Возвращает (comments, perlcritic_facts, mcp_unavailable):
       • comments — нормализованные {file,line,severity,source,body} для постинга;
@@ -1289,11 +1292,13 @@ def _inspect_file(
 
     changed = diff_filter.changed_lines_from_diff_text(f["text"])
 
-    # ── perlcritic через mcp-drospr (только Perl-файлы, при включённом слое) ──
+    perl = profile in profiles.PERL_PROFILES
+
+    # ── perlcritic через mcp-drospr (только Perl-профили, при включённом слое) ──
     perlcritic_on = (
         PERLCRITIC_ENABLED and MCP_DROSPR_URL
         and source_ref and source_project and source_repo
-        and _perl_file(path)
+        and perl
     )
     if perlcritic_on:
         # file_content уже загружен оркестратором для режима «полный файл» (spec 011) —
@@ -1334,9 +1339,9 @@ def _inspect_file(
                     })
                     facts.append(f"{path}:{iss.get('line')} [{policy}] {msg}")
 
-    # ── styleguide-grep (детерминированные правила команды, только Perl-файлы) ──
-    # Метка источника — [codestyle]: так договорились в команде (решение Ярослава).
-    if sg_rules and _perl_file(path):
+    # ── styleguide-grep (детерминированные правила команды, только Perl-профили) ──
+    # Метка источника — [codestyle]: так договорились в команде.
+    if sg_rules and perl:
         for finding in styleguide_rules.scan(f["text"], sg_rules):
             comments.append({
                 "file": path, "line": finding["line"], "severity": finding["severity"],
@@ -1528,6 +1533,15 @@ def _do_review(
     description: Optional[str] = None,
 ):
     """Внутренняя логика ревью."""
+    # Профили стеков (spec 022) — раз на PR, как стайлгайд: правки profiles.json
+    # подхватываются без рестарта. Выключенное репо — до любых запросов к Bitbucket
+    # (путь CLI; вебхук проверяет то же самое раньше, до WIP-гейта).
+    profiles_config = profiles.load()
+    repo_cfg = profiles_config.repo(f"{project}/{repo}")
+    if not repo_cfg.enabled:
+        log.info(f"⏸️ {project}/{repo}: ревью выключено в профилях")
+        return
+
     # 1. Забираем diff, разбитый по файлам
     try:
         files = get_pr_diff(project, repo, pr_id)
@@ -1594,11 +1608,20 @@ def _do_review(
         "files": len(files),
         "styleguide_chars": len(styleguide),
         "styleguide_rules": len(sg_rules),
+        "profiles_config": profiles.status(),
     })
     for f in files:
         path = f["path"]
         if f["added_lines"] == 0:
             log.info(f"⏭️ {path}: нет добавленных строк — пропускаю")
+            continue
+
+        # — Профиль стека (spec 022) — по пути и diff, ДО загрузки файла: lock-файлы
+        # и бандлы не качаются из Bitbucket и не уходят в Феникс.
+        profile, profile_reason = profiles.pre_profile(path, f["text"], repo_cfg, profiles_config)
+        if profile == profiles.SKIP:
+            log.info(f"🧭 {path}: профиль skip ({profile_reason})")
+            dry_run_record(pr_id, {"type": "skipped", "path": path, "reason": profile_reason})
             continue
 
         # — Контекст ревью: ханки или полный файл (spec 011) —
@@ -1617,9 +1640,19 @@ def _do_review(
         elif context_mode == "file":
             log.info(f"📄 {path}: ревью по полному файлу ({len(raw_code or '')} симв.)")
 
+        # Файл без расширения уточняется по shebang — первая строка уже доступна.
+        profile, profile_reason = profiles.refine_by_shebang(
+            profile, profile_reason, path, raw_code, f["text"], repo_cfg,
+        )
+        log.info(f"🧭 {path}: профиль {profile} ({profile_reason})")
+        file_ext = profiles.file_ext(path)
+        # Стайлгайд — Perl-овый: generic-файлу он не нужен и не передаётся.
+        file_styleguide = "" if profile == profiles.GENERIC else styleguide
+
         # — Inspector (детерминированный, ВНЕ семафора Феникса) —
         inspect_comments, perlcritic_facts, mcp_unavail = _inspect_file(
             f, source_project, source_repo, source_ref, sg_rules, file_content=raw_code,
+            profile=profile,
         )
         if mcp_unavail:
             inspector_incomplete = True
@@ -1636,7 +1669,8 @@ def _do_review(
         # Детерминированный коммент несёт ТОЧНЫЕ места (0 фантазий); те же факты идут
         # в Феникс, но только чтобы он объяснил ПОСЛЕДСТВИЯ (места не дублирует).
         impact_facts: list[str] = []
-        if IMPACT_ENABLED and MCP_DROSPR_URL and INSPECTOR_AVAILABLE and _perl_file(path):
+        # Только профиль perl: граф вызовов один и не знает репозиторий (spec 022).
+        if IMPACT_ENABLED and MCP_DROSPR_URL and INSPECTOR_AVAILABLE and profile == profiles.PERL:
             subs = changed_symbols.changed_subs_from_diff_text(f["text"])
             added_lines = changed_symbols.added_sub_lines(f["text"])
             # Якорь — строка любого добавленного `sub` в файле: туда вешаем коммент про
@@ -1671,11 +1705,12 @@ def _do_review(
         usage: dict = {}
         file_fenix_calls = 1
         result = ask_fenix(
-            review_text, styleguide, perlcritic_facts, impact_facts,
+            review_text, file_styleguide, perlcritic_facts, impact_facts,
             full_file=(context_mode == "file"),
             # 0 = не обрезать: полный файл не должен резаться лимитом ханков.
             truncate_lines=0 if context_mode == "file" else None,
             usage_out=usage,
+            profile=profile, file_ext=file_ext,
         )
         _accumulate_usage(pr_token_stats, usage)
         if result is None and context_mode == "file":
@@ -1688,7 +1723,8 @@ def _do_review(
             usage = {}
             file_fenix_calls = 2
             result = ask_fenix(
-                f["text"], styleguide, perlcritic_facts, impact_facts, usage_out=usage,
+                f["text"], file_styleguide, perlcritic_facts, impact_facts, usage_out=usage,
+                profile=profile, file_ext=file_ext,
             )
             _accumulate_usage(pr_token_stats, usage)
 
@@ -1745,6 +1781,8 @@ def _do_review(
         dry_run_record(pr_id, {
             "type": "file",
             "path": path,
+            "profile": profile,
+            "profile_reason": profile_reason,
             "mode": context_mode,
             "fallback_reason": fallback_reason,
             "file_chars": len(raw_code) if raw_code is not None else None,
@@ -2124,6 +2162,12 @@ async def bitbucket_webhook(request: Request, background_tasks: BackgroundTasks)
             )
             return {"status": "error", "message": "missing data"}
 
+        # ── Выключенное в профилях репо (spec 022) — ДО WIP-гейта: иначе оно получило
+        # бы уведомление о черновике, хотя ревью для него выключено целиком.
+        if not profiles.load().repo(f"{project_key}/{repo_slug}").enabled:
+            log.info(f"⏸️ {project_key}/{repo_slug}: ревью выключено в профилях")
+            return {"status": "skipped", "reason": "repo disabled", "pr_id": pr_id}
+
         # ── WIP-гейт (spec 010): не ревьюим черновик ─────────────
         # «Готов к ревью» — состояние в голове автора, а не событие в Bitbucket.
         # Делаем его событием: пока в ЗАГОЛОВКЕ PR стоит маркер (WIP) — молчим;
@@ -2190,6 +2234,9 @@ async def health():
         # с первого взгляда, а не через неделю по отсутствию комментариев.
         "context_mode": REVIEW_CONTEXT_MODE,
         "dry_run": DRY_RUN,
+        # absent — profiles.json не найден (работают умолчания); error — файл битый,
+        # бот работает на последнем исправном конфиге или умолчаниях (spec 022).
+        "profiles_config": profiles.status(),
     }
 
 
