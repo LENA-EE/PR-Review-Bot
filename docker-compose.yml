@@ -18,6 +18,16 @@ services:
       - FENIX_TIMEOUT=${FENIX_TIMEOUT:-90}
       - FENIX_MAX_CONCURRENCY=${FENIX_MAX_CONCURRENCY:-1}
       - FENIX_MAX_RETRIES=${FENIX_MAX_RETRIES:-1}
+      # Профили стеков (spec 022). profiles.json необязателен, но файл ДОЛЖЕН
+      # существовать до `up` (хотя бы `{}`): иначе Docker создаст на его месте каталог.
+      - PROFILES_PATH=${PROFILES_PATH:-/app/profiles.json}
+      - DIFF_MAX_CHARS=${DIFF_MAX_CHARS:-300000}
+      - LLM_MAX_COMMENTS_PER_FILE=${LLM_MAX_COMMENTS_PER_FILE:-10}
     volumes:
       # Стайлгайд монтируется снаружи — обновляй без перезапуска контейнера
       - ./styleguide.md:/app/styleguide.md:ro
+      # Профили стеков — правки подхватываются на следующем PR без рестарта, НО:
+      # монтирование одного файла привязано к inode, а `sed -i` и большинство
+      # редакторов создают новый файл — такую правку контейнер не увидит, нужен
+      # `docker-compose restart`. Без рестарта — только запись поверх (`cat > profiles.json`).
+      - ./profiles.json:/app/profiles.json:ro

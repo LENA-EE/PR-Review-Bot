@@ -1,0 +1,18 @@
+{
+  "skip": ["docs/generated/**", "*.pb.go"],
+  "repos": {
+    "PROJ/perl-repo": {
+      "perl_profile": "perl"
+    },
+    "PROJ/monorepo": {
+      "paths": [
+        {"glob": "docs/**",           "profile": "skip"},
+        {"glob": "backend/legacy/**", "profile": "perl-lite"},
+        {"glob": "tools/**",          "profile": "generic"}
+      ]
+    },
+    "PROJ/sandbox": {
+      "enabled": false
+    }
+  }
+}

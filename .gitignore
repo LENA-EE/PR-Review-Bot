@@ -19,6 +19,11 @@ __pycache__/
 # замечаний не должен попасть в git даже случайным `git add .`.
 *.jsonl
 DEPLOY_SERVER.md
+DEPLOY_SCRIPT.md
+
+# Боевой конфиг профилей стеков (spec 022): ключи банковских репозиториев.
+# В git — только profiles.example.json.
+profiles.json
 
 # Claude Code — локальная обвязка, в банк не едет (там opencode → .opencode/)
 .claude/

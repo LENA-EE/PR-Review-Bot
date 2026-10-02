@@ -27,7 +27,7 @@ RUN pip install --no-cache-dir \
     -r requirements.txt
 
 # Код бота
-COPY pr_review_bot.py .
+COPY pr_review_bot.py profiles.py ./
 
 # Стайлгайд — необязательный файл, монтируется снаружи через volume
 # (см. docker-compose.yml). В образ НЕ кладём.
